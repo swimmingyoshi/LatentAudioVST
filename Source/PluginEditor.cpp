@@ -752,15 +752,23 @@ void LatentAudioVSTAudioProcessorEditor::updateUIFromProcessor()
     juce::Logger::writeToLog("[updateUIFromProcessor] Setting cursor to (" + juce::String(x) + ", " + juce::String(y) + ")");
     nebulaComp.setCursorPosition(x, y);
 
-    // Update status labels if model/map are loaded
-    if (audioProcessor.decoder.isModelLoaded())
+    // Update status labels - clear if not loaded, set if loaded
+    if (audioProcessor.decoder.isModelLoaded() && audioProcessor.modelPath.exists())
     {
-        modelStatusLabel.setText("Model: " + modelFiles[0].getFileName(), juce::dontSendNotification);
+        modelStatusLabel.setText("Model: " + audioProcessor.modelPath.getFileName(), juce::dontSendNotification);
+    }
+    else
+    {
+        modelStatusLabel.setText("No model loaded", juce::dontSendNotification);
     }
 
-    if (!audioProcessor.soundMap.getPoints().empty())
+    if (!audioProcessor.soundMap.getPoints().empty() && audioProcessor.soundMapPath.exists())
     {
-        soundMapStatusLabel.setText("Sound Map: " + jsonFiles[0].getFileName(), juce::dontSendNotification);
+        soundMapStatusLabel.setText("Sound Map: " + audioProcessor.soundMapPath.getFileName(), juce::dontSendNotification);
+    }
+    else
+    {
+        soundMapStatusLabel.setText("", juce::dontSendNotification);
     }
 
     // ADD THIS: Update folder path display
