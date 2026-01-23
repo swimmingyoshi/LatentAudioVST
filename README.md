@@ -268,6 +268,10 @@ This is an open-source project. Contributions for new features, bug fixes, and m
 
 This project is licensed under the GNU Affero General Public License Version 3 (AGPLv3). See the [LICENSE](LICENSE) and [LICENSE INTENT](LICENSE-INTENT.md) file for details.
 
+## Third-Party Libraries
+
+See `THIRD_PARTY_LICENSES.md` for attribution and licensing of libraries included in the binary.
+
 ## Credits
 
 Built with JUCE framework and ONNX Runtime.
