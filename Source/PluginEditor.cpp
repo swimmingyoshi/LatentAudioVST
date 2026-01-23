@@ -718,13 +718,24 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
     static float lastY = -999.0f;
     float currentX = audioProcessor.currentX.load();
     float currentY = audioProcessor.currentY.load();
-
-    if (std::abs(currentX - lastX) > 0.001f || std::abs(currentY - lastY) > 0.001f)
+    // Calculate normalized coordinates for display
+    float minX = audioProcessor.soundMap.getMinX();
+    float maxX = audioProcessor.soundMap.getMaxX();
+    float minY = audioProcessor.soundMap.getMinY();
+    float maxY = audioProcessor.soundMap.getMaxY();
+    // Guard against division by zero
+    float xRange = maxX - minX;
+    float yRange = maxY - minY;
+    if (xRange <= 0.0f) xRange = 1.0f;
+    if (yRange <= 0.0f) yRange = 1.0f;
+    float normalizedX = juce::jlimit(0.0f, 1.0f, (currentX - minX) / xRange);
+    float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - currentY) / yRange);  // Inverted for Y mapping
+    if (std::abs(normalizedX - lastX) > 0.001f || std::abs(normalizedY - lastY) > 0.001f)
     {
-        xCoordLabel.setText("X: " + juce::String(currentX, 3), juce::dontSendNotification);
-        yCoordLabel.setText("Y: " + juce::String(currentY, 3), juce::dontSendNotification);
-        lastX = currentX;
-        lastY = currentY;
+        xCoordLabel.setText("X: " + juce::String(normalizedX, 3), juce::dontSendNotification);
+        yCoordLabel.setText("Y: " + juce::String(normalizedY, 3), juce::dontSendNotification);
+        lastX = normalizedX;
+        lastY = normalizedY;
     }
 }
 
