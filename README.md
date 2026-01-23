@@ -266,7 +266,7 @@ This is an open-source project. Contributions for new features, bug fixes, and m
 
 ## License
 
-This project is licensed under the GNU Affero General Public License Version 3 (AGPLv3). See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License Version 3 (AGPLv3). See the [LICENSE](LICENSE) and [LICENSE INTENT](LICENSE-INTENT.md) file for details.
 
 ## Credits
 
