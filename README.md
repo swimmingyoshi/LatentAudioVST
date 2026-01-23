@@ -49,6 +49,8 @@ A precompiled VST binary is available in the [GitHub Releases](https://github.co
 This binary includes third-party software listed in `THIRD_PARTY_LICENSES.md`.  
 Source code is always available in this repository.
 
+Models can be found in huggingface [repo](https://huggingface.co/Meowmeow42/LatentAudioVST/tree/main)
+
 ### Installation
 1. Build the project using the provided Visual Studio solution
 2. Copy the resulting `.vst3` file to your VST3 directory:
