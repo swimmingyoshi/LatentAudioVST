@@ -2,7 +2,7 @@ PROJECT WAS BUILT WITH PROJUCER/JUCE. - https://juce.com/download/
 
 Project was made in Visual Studio 2022 but i assume other versions will work (check juce) - https://visualstudio.microsoft.com/downloads/
 
-USES ONNX RUNTIME (CPU) - https://onnxruntime.ai/
+USES ONNX RUNTIME (CPU) -  https://github.com/microsoft/onnxruntime/releases
 
 Once built, Onnx dlls will go into the Built VST3 folder, next to the nested vst3 file.
 `LatentAudioVST.vst3\Contents\x86_64-win\LatentAudioVST.vst3` <-- dlls here
