@@ -1,0 +1,184 @@
+# JUCE Project .gitignore
+
+# =============================================================================
+# General Development Files
+# =============================================================================
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Visual Studio & Windows Build Files
+# =============================================================================
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio directories
+.vs/
+Generated Files/
+
+# Build artifacts
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*.log
+*.vspscc
+*.vssscc
+*.pidb
+*.svclog
+*.scc
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+
+# =============================================================================
+# JUCE-Specific Files
+# =============================================================================
+
+# JUCE Projucer files (keep the .jucer file, ignore generated)
+Builds/
+!Builds/VisualStudio2022/LatentAudioVST.sln
+!Builds/VisualStudio2022/LatentAudioVST_*.vcxproj
+!Builds/VisualStudio2022/LatentAudioVST_*.vcxproj.filters
+
+# JUCE compiled modules
+JuceLibraryCode/include_juce_*.cpp
+JuceLibraryCode/include_juce_*.mm
+
+# =============================================================================
+# Audio & Model Files
+# =============================================================================
+
+*.wav
+*.aiff
+*.mp3
+*.flac
+*.ogg
+
+
+*.onnx
+*.pth
+
+# =============================================================================
+# IDE & Editor Files
+# =============================================================================
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Xcode
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.xcuserstate
+
+# JetBrains (CLion, etc.)
+.idea/
+*.iml
+
+# =============================================================================
+# Dependency & Package Files
+# =============================================================================
+
+# Node modules
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =============================================================================
+# Temporary & Backup Files
+# =============================================================================
+
+# Backup files
+*~
+*.bak
+*.backup
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+
+# =============================================================================
+# Project-Specific Exclusions
+# =============================================================================
+
+# Keep the sound map JSON file
+!Source/VST_Export/sound_map.json
+
+# Ignore any generated audio output
+Source/VST_Export/generated_audio/
+Source/VST_Export/latent_decoder.onnx
+*.onnx
+*.pth
+*.pt
+
+.claude/
+Libs/*
+!Libs/.gitkeep
+
+Ctemp
+JuceLibraryCode
+KickModel
