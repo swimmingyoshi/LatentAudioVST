@@ -755,12 +755,12 @@ void LatentAudioVSTAudioProcessorEditor::updateUIFromProcessor()
     // Update status labels if model/map are loaded
     if (audioProcessor.decoder.isModelLoaded())
     {
-        modelStatusLabel.setText("Model: Loaded", juce::dontSendNotification);
+        modelStatusLabel.setText("Model: " + modelFiles[0].getFileName(), juce::dontSendNotification);
     }
 
     if (!audioProcessor.soundMap.getPoints().empty())
     {
-        soundMapStatusLabel.setText("Sound Map: " + juce::String(audioProcessor.soundMap.getPoints().size()) + " points", juce::dontSendNotification);
+        soundMapStatusLabel.setText("Sound Map: " + jsonFiles[0].getFileName(), juce::dontSendNotification);
     }
 
     // ADD THIS: Update folder path display
