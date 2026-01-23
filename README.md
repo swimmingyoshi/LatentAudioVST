@@ -1,3 +1,12 @@
+PROJECT WAS BUILT WITH PROJUCER/JUCE. - https://juce.com/download/
+
+Project was made in Visual Studio 2022 but i assume other versions will work (check juce) - https://visualstudio.microsoft.com/downloads/
+
+USES ONNX RUNTIME (CPU) - https://onnxruntime.ai/
+
+Once built, Onnx dlls will go into the Built VST3 folder, next to the nested vst3 file.
+`LatentAudioVST.vst3\Contents\x86_64-win\LatentAudioVST.vst3` <-- dlls here
+
 # LatentAudioVST
 
 LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interactive exploration of latent audio representations. It allows musicians and sound designers to navigate a 2D latent space where each position corresponds to a unique audio sample, enabling continuous and creative audio generation through visual exploration.
