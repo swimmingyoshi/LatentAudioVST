@@ -11,6 +11,8 @@ Once built, Onnx dlls will go into the Built VST3 folder, next to the nested vst
 
 LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interactive exploration of latent audio representations. It allows musicians and sound designers to navigate a 2D latent space where each position corresponds to a unique audio sample, enabling continuous and creative audio generation through visual exploration.
 
+[Watch the demo video on YouTube](https://www.youtube.com/watch?v=94xgIDpDgX0)
+
 ## How It Works
 
 LatentAudioVST uses machine learning models trained on audio samples to create a compressed "latent" representation of sound. Each point in a 2D coordinate system maps to a high-dimensional latent vector that, when decoded by an ONNX neural network model, produces audio.
@@ -39,6 +41,13 @@ LatentAudioVST uses machine learning models trained on audio samples to create a
 ### Prerequisites
 - DAW supporting VST3 plugins (Ableton Live, Logic Pro, FL Studio, etc.)
 - Windows 10/11 (currently Windows-only)
+
+
+## Prebuilt Binary
+
+A precompiled VST binary is available in the [GitHub Releases](https://github.com/swimmingyoshi/LatentAudioVST/releases) section.  
+This binary includes third-party software listed in `THIRD_PARTY_LICENSES.md`.  
+Source code is always available in this repository.
 
 ### Installation
 1. Build the project using the provided Visual Studio solution
