@@ -1128,7 +1128,7 @@ void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
 {
     float minY = soundMap.getMinY();
     float maxY = soundMap.getMaxY();
-    float actualY = minY - normalizedY * (maxY - minY);
+    float actualY = maxY - normalizedY * (maxY - minY);
 
     // Offline mode: just update position, let processBlock handle sync inference
     if (isOfflineMode.load())
