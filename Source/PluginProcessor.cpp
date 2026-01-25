@@ -1089,6 +1089,12 @@ void LatentAudioVSTAudioProcessor::setSampleStart(float start)
 
 void LatentAudioVSTAudioProcessor::setPositionX(float normalizedX)
 {
+    // Skip if we're syncing from triggerInference to avoid feedback loop
+    if (syncingPositionParams.load())
+    {
+        return;
+    }
+
     float minX = soundMap.getMinX();
     float maxX = soundMap.getMaxX();
     float actualX = minX + normalizedX * (maxX - minX);
@@ -1126,6 +1132,12 @@ void LatentAudioVSTAudioProcessor::setPositionX(float normalizedX)
 
 void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
 {
+    // Skip if we're syncing from triggerInference to avoid feedback loop
+    if (syncingPositionParams.load())
+    {
+        return;
+    }
+
     float minY = soundMap.getMinY();
     float maxY = soundMap.getMaxY();
     float actualY = maxY - normalizedY * (maxY - minY);
@@ -1193,6 +1205,32 @@ void LatentAudioVSTAudioProcessor::triggerInference(float x, float y)
     // Update active position tracking
     currentX.store(x);
     currentY.store(y);
+
+    // Sync position parameters to APVTS so DAW automation tracks the current position
+    float minX = soundMap.getMinX();
+    float maxX = soundMap.getMaxX();
+    float minY = soundMap.getMinY();
+    float maxY = soundMap.getMaxY();
+
+    float rangeX = maxX - minX;
+    float rangeY = maxY - minY;
+
+    if (rangeX > 0.0001f && rangeY > 0.0001f)
+    {
+        float normalizedX = juce::jlimit(0.0f, 1.0f, (x - minX) / rangeX);
+        float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - y) / rangeY); // Y is inverted
+
+        // Set guard flag to prevent feedback loop
+        syncingPositionParams.store(true);
+
+        // Update APVTS parameters - this notifies the host for automation recording
+        if (auto* paramX = parameters->getParameter("positionX"))
+            paramX->setValueNotifyingHost(normalizedX);
+        if (auto* paramY = parameters->getParameter("positionY"))
+            paramY->setValueNotifyingHost(normalizedY);
+
+        syncingPositionParams.store(false);
+    }
 
     if (playbackPosition.load() < 0)
     {
@@ -1525,6 +1563,26 @@ void LatentAudioVSTAudioProcessor::setStateInformation(const void* data, int siz
         {
             juce::Logger::writeToLog("[setStateInformation] Loading model and map...");
             loadModelAndMap();
+        }
+        else if (soundMap.getLatentDim() > 0)
+        {
+            // Sync position parameters even if not loading model (model already loaded)
+            float minX = soundMap.getMinX();
+            float maxX = soundMap.getMaxX();
+            float minY = soundMap.getMinY();
+            float maxY = soundMap.getMaxY();
+
+            float rangeX = maxX - minX;
+            float rangeY = maxY - minY;
+
+            if (rangeX > 0.0001f && rangeY > 0.0001f)
+            {
+                float normalizedX = juce::jlimit(0.0f, 1.0f, (restoredX - minX) / rangeX);
+                float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - restoredY) / rangeY);
+
+                parameters->getParameter("positionX")->setValue(normalizedX);
+                parameters->getParameter("positionY")->setValue(normalizedY);
+            }
         }
 
         // Restore audio data from Base64 properties

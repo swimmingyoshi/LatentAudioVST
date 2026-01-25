@@ -177,6 +177,9 @@ private:
     float lastBackgroundY = 0.0f;
     bool backgroundPositionChanged = false;
 
+    // Guard flag to prevent feedback loop when syncing position parameters
+    std::atomic<bool> syncingPositionParams{ false };
+
     // Envelope params
     std::atomic<bool> triggerOnMidi{ false };
     std::atomic<float> outputGain{ 1.0f };
