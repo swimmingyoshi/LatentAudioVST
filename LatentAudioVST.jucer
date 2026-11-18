@@ -27,6 +27,8 @@
             file="Source/PluginProcessor.h"/>
       <FILE id="PluginProcessor_cpp" name="PluginProcessor.cpp" compile="1"
             resource="0" file="Source/PluginProcessor.cpp"/>
+      <FILE id="LatentLookAndFeel_h" name="LatentLookAndFeel.h" compile="0"
+            resource="0" file="Source/LatentLookAndFeel.h"/>
       <FILE id="PluginEditor_h" name="PluginEditor.h" compile="0" resource="0"
             file="Source/PluginEditor.h"/>
       <FILE id="PluginEditor_cpp" name="PluginEditor.cpp" compile="1" resource="0"
@@ -34,21 +36,21 @@
     </GROUP>
   </MAINGROUP>
   <MODULES>
-    <MODULE id="juce_audio_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_audio_devices" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_audio_formats" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
+    <MODULE id="juce_audio_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_audio_devices" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_audio_formats" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
     <MODULE id="juce_audio_plugin_client" showAllCode="1" useLocalCopy="0"
-            useGlobalPath="1"/>
-    <MODULE id="juce_audio_processors" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
+            useGlobalPath="0"/>
+    <MODULE id="juce_audio_processors" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
     <MODULE id="juce_audio_processors_headless" showAllCode="1" useLocalCopy="0"
-            useGlobalPath="1"/>
-    <MODULE id="juce_audio_utils" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_core" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_data_structures" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_events" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_graphics" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_gui_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
-    <MODULE id="juce_gui_extra" showAllCode="1" useLocalCopy="0" useGlobalPath="1"/>
+            useGlobalPath="0"/>
+    <MODULE id="juce_audio_utils" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_core" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_data_structures" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_events" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_graphics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_gui_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_gui_extra" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
   </MODULES>
   <JUCEOPTIONS JUCE_STRICT_REFCOUNTEDPOINTER="1" JUCE_VST3_CAN_REPLACE_VST2="0"/>
   <EXPORTFORMATS>
@@ -58,19 +60,19 @@
         <CONFIGURATION isDebug="0" name="Release" targetName="LatentAudioVST" libraryPath="..\..\Libs\onnxruntime-win-x64-1.16.3\lib"/>
       </CONFIGURATIONS>
       <MODULEPATHS>
-        <MODULEPATH id="juce_audio_basics" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_devices" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_formats" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_plugin_client" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_processors" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_utils" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_core" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_data_structures" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_events" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_graphics" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_gui_basics" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_gui_extra" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
-        <MODULEPATH id="juce_audio_processors_headless" path="C:/Users/SWIM/Documents/Coding/CPP/VST_Plugin/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_basics" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_devices" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_formats" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_plugin_client" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_processors" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_utils" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_core" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_data_structures" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_events" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_graphics" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_gui_basics" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_gui_extra" path="../../VST_Plugins/JUCE/modules"/>
+        <MODULEPATH id="juce_audio_processors_headless" path="../../VST_Plugins/JUCE/modules"/>
       </MODULEPATHS>
     </VS2022>
   </EXPORTFORMATS>
