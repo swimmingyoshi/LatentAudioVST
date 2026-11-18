@@ -2,10 +2,16 @@ PROJECT WAS BUILT WITH PROJUCER/JUCE. - https://juce.com/download/
 
 Project was made in Visual Studio 2022 but i assume other versions will work (check juce) - https://visualstudio.microsoft.com/downloads/
 
-USES ONNX RUNTIME (CPU) - https://github.com/microsoft/onnxruntime/releases/download/v1.16.3/onnxruntime-win-x64-1.16.3.zip
+USES ONNX RUNTIME 1.16.3 - https://github.com/microsoft/onnxruntime/releases/tag/v1.16.3
+- CPU build: `onnxruntime-win-x64-1.16.3.zip`
+- GPU build (adds CUDA): `onnxruntime-win-x64-gpu-1.16.3.zip`
 
-If Building yourself, you need to have the onnx folder in Libs: 
+At model load the plugin tries CUDA -> DirectML -> CPU and uses the first provider that works; the active provider is shown in the UI. Without the CUDA provider DLLs (or a CUDA-capable GPU) it falls back to CPU automatically.
+
+If Building yourself, you need to have the onnx folder in Libs (extract either build's contents into this folder name): 
 `.\Libs\onnxruntime-win-x64-1.16.3`
+
+The `.jucer` expects the JUCE `modules` folder at `../../VST_Plugins/JUCE/modules` relative to this project folder. Change the module paths in Projucer if your JUCE lives elsewhere.
 
 Once built, Onnx dlls will go into the Built VST3 folder, next to the nested vst3 file.
 `LatentAudioVST.vst3\Contents\x86_64-win\LatentAudioVST.vst3` <-- dlls here
@@ -109,17 +115,6 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 - **Filter Cutoff**: Low-pass filter frequency (20Hz - 20kHz)
 - **Filter Resonance**: Filter emphasis (0.0 - 1.0)
 
-#### Envelope (ADSR)
-- **Attack**: Time to reach full volume (0.001 - 2.0s)
-- **Decay**: Time to reach sustain level (0.001 - 2.0s)
-- **Sustain**: Volume during hold (0.0 - 1.0)
-- **Release**: Time to fade out (0.01 - 5.0s)
-
-#### Morphing
-- **Morph Speed**: Automation rate when enabled (0.0 - 5.0)
-- **Morph Rate**: Oscillation frequency (0.1 - 20.0 Hz)
-- **Morph Depth X/Y**: Movement range in each dimension (0.0 - 1.0)
-
 #### Master
 - **Output Gain**: Overall volume (-∞ to +6dB)
 - **Dry/Wet Mix**: Blend between processed and unprocessed audio (0% - 100%)
@@ -136,17 +131,17 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 ### Real-time Exploration
 Navigate the latent space continuously, with smooth interpolation between audio samples creating organic transitions between different sounds.
 
-### Morphing
-Enable automated movement through the latent space with customizable speed, depth, and oscillation patterns for evolving soundscapes.
+### GPU Inference
+Decoding runs on CUDA or DirectML when available and falls back to CPU otherwise.
 
 ### MIDI Integration
 Trigger audio generation via MIDI notes, allowing synchronization with sequencers and musical performance.
 
-### Envelope Shaping
-Full ADSR envelope control for shaping the amplitude of generated sounds, from percussive to sustained tones.
+### Envelope
+A fixed, very short attack/release gate (1 ms / 20 ms) declicks note starts and stops; the generated sample's own shape is preserved.
 
 ### Audio Processing
-Built-in low-pass filtering with resonance control for timbral modification of the generated audio.
+Built-in 4th-order low-pass filter with resonance, applied live (changing it does not re-run inference).
 
 ### Crossfading
 Seamless transitions between different positions with adjustable crossfade time to eliminate audio artifacts.
@@ -162,7 +157,8 @@ Support for different ONNX models and sound maps, allowing exploration of variou
 ### Core Components
 
 #### LatentDecoder (`LatentDecoder.cpp/h`)
-- Manages ONNX Runtime session
+- Manages ONNX Runtime session (shared across plugin instances)
+- Picks the execution provider (CUDA -> DirectML -> CPU)
 - Handles model loading and inference
 - Converts latent vectors to audio waveforms
 
@@ -173,7 +169,7 @@ Support for different ONNX models and sound maps, allowing exploration of variou
 
 #### PluginProcessor (`PluginProcessor.cpp/h`)
 - Main audio processing logic
-- Manages playback state and envelopes
+- Manages playback state, crossfades, and the live filter
 - Coordinates inference and UI updates
 
 #### InferenceThread (`InferenceThread.h`)
@@ -207,11 +203,11 @@ Support for different ONNX models and sound maps, allowing exploration of variou
 ### Getting Started
 1. Load a model folder with compatible ONNX model and JSON sound map
 2. Click around the nebula view to explore different sounds
-3. Use the envelope controls to shape the sound's character
-4. Enable morphing for automated exploration
+3. Use the filter, playback rate, and sample start/length to shape the sound
+4. Automate the hidden Position X/Y parameters for movement over time
 
 ### Creative Techniques
-- **Morphing Exploration**: Set morph speed > 0 and adjust depth for evolving textures
+- **Automated Exploration**: Draw automation for Position X/Y for evolving textures
 - **MIDI Sequencing**: Use with a DAW to create sequenced latent space journeys
 - **Layering**: Combine multiple instances with different models for complex sound design
 - **Filtering**: Use the filter to create movement within static positions
@@ -246,7 +242,7 @@ Support for different ONNX models and sound maps, allowing exploration of variou
 - Ensure latent dimensions are consistent
 
 #### Performance Issues
-- Reduce morph complexity or inference rate
+- Lower the inference rate parameter
 - Use smaller models or sparser sound maps
 - Close other CPU-intensive applications
 
