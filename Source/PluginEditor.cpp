@@ -20,18 +20,14 @@
 
 //==============================================================================
 LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor(LatentAudioVSTAudioProcessor& p)
-    : AudioProcessorEditor(&p), audioProcessor(p), nebulaComp(p.soundMap), filterGraph(p), envelopeGraph(p), midiIndicator(p)
+    : AudioProcessorEditor(&p), audioProcessor(p), nebulaComp(p.soundMap), filterGraph(p), midiIndicator(p)
 {
+    setLookAndFeel(&laf);
     setSize(900, 750);
 
     // Nebula callbacks
     nebulaComp.onCursorChanged = [this](float x, float y)
         {
-            if (morphSpeedSlider.getValue() > 0.0)
-            {
-                morphSpeedSlider.setValue(0.0, juce::dontSendNotification);
-                audioProcessor.setMorphSpeed(0.0f);
-            }
             audioProcessor.triggerInference(x, y);
         };
 
@@ -45,7 +41,6 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor(LatentAud
 
     addAndMakeVisible(waveformComp);
     addAndMakeVisible(filterGraph);
-    addAndMakeVisible(envelopeGraph);
     addAndMakeVisible(midiIndicator);
 
     // === PLAYBACK Section ===
@@ -110,121 +105,6 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor(LatentAud
     resoLabel.setText("Reso", juce::dontSendNotification);
     resoLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(resoLabel);
-
-    // === ENVELOPE Section (Full ADSR) ===
-
-    // Attack
-    attackSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    attackSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    attackSlider.setRange(0.001, 2.0, 0.001);
-    attackSlider.setSkewFactorFromMidPoint(0.1);
-    attackSlider.setValue(0.01);
-    attackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "attackTime", attackSlider);
-    attackSlider.onValueChange = [this] {
-        envelopeGraph.repaint();
-        };
-    addAndMakeVisible(attackSlider);
-    attackLabel.setText("Attack", juce::dontSendNotification);
-    attackLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(attackLabel);
-
-    // Decay
-    decaySlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    decaySlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    decaySlider.setRange(0.001, 1.0, 0.001);
-    decaySlider.setSkewFactorFromMidPoint(0.1);
-    decaySlider.setValue(0.1);
-    decayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "decayTime", decaySlider);
-    decaySlider.onValueChange = [this] {
-        envelopeGraph.repaint();
-        };
-    addAndMakeVisible(decaySlider);
-    decayLabel.setText("Decay", juce::dontSendNotification);
-    decayLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(decayLabel);
-
-    // Sustain
-    sustainSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    sustainSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    sustainSlider.setRange(0.0, 1.0, 0.01);
-    sustainSlider.setValue(0.7);
-    sustainAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "sustainLevel", sustainSlider);
-    sustainSlider.onValueChange = [this] {
-        envelopeGraph.repaint();
-        };
-    addAndMakeVisible(sustainSlider);
-    sustainLabel.setText("Sustain", juce::dontSendNotification);
-    sustainLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(sustainLabel);
-
-    // Release
-    releaseSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    releaseSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    releaseSlider.setRange(0.01, 5.0, 0.001);
-    releaseSlider.setSkewFactorFromMidPoint(0.1);
-    releaseSlider.setValue(0.5);
-    releaseAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "releaseTime", releaseSlider);
-    releaseSlider.onValueChange = [this] {
-        envelopeGraph.repaint();
-        };
-    addAndMakeVisible(releaseSlider);
-    releaseLabel.setText("Release", juce::dontSendNotification);
-    releaseLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(releaseLabel);
-
-    // === MORPH Section (Now its own section) ===
-
-    // Speed
-    morphSpeedSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    morphSpeedSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    morphSpeedSlider.setRange(0.0, 5.0, 0.1);
-    morphSpeedSlider.setValue(0.0);
-    morphSpeedAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "morphSpeed", morphSpeedSlider);
-    addAndMakeVisible(morphSpeedSlider);
-    morphSpeedLabel.setText("Speed", juce::dontSendNotification);
-    morphSpeedLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(morphSpeedLabel);
-
-    // Morph Rate
-    morphRateSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    morphRateSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    morphRateSlider.setRange(0.1, 20.0, 0.1);
-    morphRateSlider.setValue(2.0);
-    morphRateAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "morphRate", morphRateSlider);
-    addAndMakeVisible(morphRateSlider);
-    morphRateLabel.setText("Rate", juce::dontSendNotification);
-    morphRateLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(morphRateLabel);
-
-    // Morph Depth X
-    morphDepthXSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    morphDepthXSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    morphDepthXSlider.setRange(0.0, 1.0, 0.01);
-    morphDepthXSlider.setValue(1.0);
-    morphDepthXAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "morphDepthX", morphDepthXSlider);
-    addAndMakeVisible(morphDepthXSlider);
-    morphDepthXLabel.setText("Range X", juce::dontSendNotification);
-    morphDepthXLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(morphDepthXLabel);
-
-    // Morph Depth Y
-    morphDepthYSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    morphDepthYSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
-    morphDepthYSlider.setRange(0.0, 1.0, 0.01);
-    morphDepthYSlider.setValue(1.0);
-    morphDepthYAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        *audioProcessor.parameters, "morphDepthY", morphDepthYSlider);
-    addAndMakeVisible(morphDepthYSlider);
-    morphDepthYLabel.setText("Range Y", juce::dontSendNotification);
-    morphDepthYLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(morphDepthYLabel);
 
     // === MASTER Section ===
 
@@ -329,7 +209,7 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor(LatentAud
     unloadModelButton.addListener(this);
 
     modelFolderPathLabel.setText("No model loaded", juce::dontSendNotification);
-    modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+    modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
     modelFolderPathLabel.setJustificationType(juce::Justification::centredLeft);
 
     addAndMakeVisible(randomButton);
@@ -343,21 +223,15 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor(LatentAud
     addAndMakeVisible(xCoordLabel);
     addAndMakeVisible(yCoordLabel);
 
+    providerLabel.setJustificationType(juce::Justification::centredLeft);
+    providerLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
+    providerLabel.setText("Provider: None", juce::dontSendNotification);
+    addAndMakeVisible(providerLabel);
+
     setResizable(true, true);
     setResizeLimits(700, 500, 1920, 1080);
 
     startTimer(30);
-}
-
-void LatentAudioVSTAudioProcessorEditor::updateEnvelope()
-{
-    audioProcessor.setEnvelope(
-        (float)attackSlider.getValue(),
-        (float)decaySlider.getValue(),
-        (float)sustainSlider.getValue(),
-        (float)releaseSlider.getValue()
-    );
-    envelopeGraph.repaint();
 }
 
 void LatentAudioVSTAudioProcessorEditor::resetAllKnobs()
@@ -370,18 +244,6 @@ void LatentAudioVSTAudioProcessorEditor::resetAllKnobs()
     // FILTER defaults
     cutoffSlider.setValue(10000.0, juce::sendNotificationSync);
     resoSlider.setValue(0.0, juce::sendNotificationSync);
-
-    // ENVELOPE defaults
-    attackSlider.setValue(0.01, juce::sendNotificationSync);
-    decaySlider.setValue(0.1, juce::sendNotificationSync);
-    sustainSlider.setValue(0.7, juce::sendNotificationSync);
-    releaseSlider.setValue(0.5, juce::sendNotificationSync);
-
-    // MORPH defaults
-    morphSpeedSlider.setValue(0.0, juce::sendNotificationSync);
-    morphRateSlider.setValue(2.0, juce::sendNotificationSync);
-    morphDepthXSlider.setValue(1.0, juce::sendNotificationSync);
-    morphDepthYSlider.setValue(1.0, juce::sendNotificationSync);
 
     // MASTER defaults
     gainSlider.setValue(1.0, juce::sendNotificationSync);
@@ -397,29 +259,82 @@ void LatentAudioVSTAudioProcessorEditor::resetAllKnobs()
 LatentAudioVSTAudioProcessorEditor::~LatentAudioVSTAudioProcessorEditor()
 {
     stopTimer();
+    setLookAndFeel(nullptr);
 }
 
 //==============================================================================
 void LatentAudioVSTAudioProcessorEditor::paint(juce::Graphics& g)
 {
-    g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));
+    // Deep dark background
+    g.fillAll(juce::Colour(0xff0d0d1a));
 
-    // Draw section labels
-    g.setColour(juce::Colours::white.withAlpha(0.7f));
-    g.setFont(14.0f);
+    // Very subtle dot-grid texture over the top (toggle/model/coord rows)
+    {
+        auto area    = getLocalBounds().reduced(10);
+        auto ctrlH   = 400;
+        auto waveH   = 80;
+        auto topArea = juce::Rectangle<int>(area.getX(), area.getY(),
+                                            area.getWidth(),
+                                            area.getHeight() - ctrlH - waveH);
+        g.setColour(juce::Colour(0xff141428));
+        g.fillRect(topArea);
+        g.setColour(juce::Colour(0xff1a1a30));
+        for (int gx = topArea.getX(); gx < topArea.getRight(); gx += 24)
+            for (int gy = topArea.getY(); gy < topArea.getBottom(); gy += 24)
+                g.fillRect(gx, gy, 1, 1);
+        g.setColour(juce::Colour(0xff2a2a4a));
+        g.drawRect(topArea, 1);
+    }
 
-    auto area = getLocalBounds().reduced(10);
-    auto controlsArea = area.removeFromBottom(400);
+    // Waveform background strip
+    {
+        auto area      = getLocalBounds().reduced(10);
+        auto ctrlArea  = area.removeFromBottom(400);
+        auto waveArea  = area.removeFromBottom(80);
+        g.setColour(juce::Colour(0xff0d0d1a));
+        g.fillRect(waveArea);
+    }
 
-    int sectionWidth = controlsArea.getWidth() / 5; // Changed from 4 to 5 sections
+    // Section panels
+    {
+        auto area         = getLocalBounds().reduced(10);
+        auto controlsArea = area.removeFromBottom(400);
+        int  sectionWidth = controlsArea.getWidth() / 3;
 
-    // Draw section labels without modifying controlsArea
-    auto labelArea = controlsArea;
-    g.drawText("PLAYBACK", labelArea.removeFromLeft(sectionWidth), juce::Justification::centredTop, true);
-    g.drawText("FILTER", labelArea.removeFromLeft(sectionWidth), juce::Justification::centredTop, true);
-    g.drawText("ENVELOPE", labelArea.removeFromLeft(sectionWidth), juce::Justification::centredTop, true);
-    g.drawText("MORPH", labelArea.removeFromLeft(sectionWidth), juce::Justification::centredTop, true);
-    g.drawText("MASTER", labelArea, juce::Justification::centredTop, true);
+        struct SectionInfo { const char* name; juce::Colour accent; };
+        SectionInfo sections[] = {
+            { "PLAYBACK", juce::Colour(0xff7b50f0) },
+            { "FILTER",   juce::Colour(0xff38bdf8) },
+            { "MASTER",   juce::Colour(0xfff06080) },
+        };
+
+        auto secArea = controlsArea;
+        for (int i = 0; i < 3; ++i)
+        {
+            auto sec = (i < 2) ? secArea.removeFromLeft(sectionWidth) : secArea;
+            auto fb  = sec.toFloat().reduced(2.0f);
+
+            // Panel fill
+            g.setColour(juce::Colour(0xff141428));
+            g.fillRoundedRectangle(fb, 8.0f);
+
+            // Top accent stripe
+            juce::Rectangle<float> bar(fb.getX() + 8.0f, fb.getY() + 4.0f,
+                                       fb.getWidth() - 16.0f, 2.5f);
+            g.setColour(sections[i].accent);
+            g.fillRoundedRectangle(bar, 1.5f);
+
+            // Panel border
+            g.setColour(juce::Colour(0xff2a2a4a));
+            g.drawRoundedRectangle(fb.reduced(0.5f), 8.0f, 1.0f);
+
+            // Section title
+            g.setFont(juce::Font(9.5f, juce::Font::bold));
+            g.setColour(sections[i].accent.withAlpha(0.85f));
+            g.drawText(sections[i].name, sec.reduced(5, 12),
+                       juce::Justification::centredTop, true);
+        }
+    }
 }
 
 void LatentAudioVSTAudioProcessorEditor::resized()
@@ -474,6 +389,8 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     xCoordLabel.setBounds(coordArea.removeFromLeft(coordWidth));
     coordArea.removeFromLeft(spacing);
     yCoordLabel.setBounds(coordArea.removeFromLeft(coordWidth));
+    coordArea.removeFromLeft(spacing);
+    providerLabel.setBounds(coordArea.removeFromLeft(130));
 
     // Position reset button in upper right corner
     int resetButtonWidth = 120;
@@ -483,29 +400,25 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     nebulaComp.setBounds(nebulaArea);
     waveformComp.setBounds(waveformArea);
 
-    // Layout controls in 5 sections (was 4)
-    int sectionWidth = controlsArea.getWidth() / 5;
+    // Layout controls in 3 sections
+    int sectionWidth = controlsArea.getWidth() / 3;
     int labelHeight = 20;
 
-    // === PLAYBACK Section ===
+    // === PLAYBACK Section (3 vertical knobs: Rate, Tune, X-Fade) ===
     auto playbackSection = controlsArea.removeFromLeft(sectionWidth).reduced(5);
     playbackSection.removeFromTop(20); // Space for section label
 
-    int pbItems = 3;
-    int pbItemHeight = playbackSection.getHeight() / pbItems;
+    int pbItemHeight = playbackSection.getHeight() / 3;
 
-    // Rate
     auto rateArea = playbackSection.removeFromTop(pbItemHeight);
     rateLabel.setBounds(rateArea.removeFromTop(labelHeight));
     rateSlider.setBounds(rateArea.reduced(2));
 
-    // Tune
     auto tuneArea = playbackSection.removeFromTop(pbItemHeight);
     tuneLabel.setBounds(tuneArea.removeFromTop(labelHeight));
     tuneSlider.setBounds(tuneArea.reduced(2));
 
-    // Crossfade
-    auto xfadeArea = playbackSection.removeFromTop(pbItemHeight);
+    auto xfadeArea = playbackSection;
     crossfadeLabel.setBounds(xfadeArea.removeFromTop(labelHeight));
     crossfadeSlider.setBounds(xfadeArea.reduced(2));
 
@@ -529,72 +442,6 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     auto resoArea = filterSection.removeFromTop(filterItemHeight);
     resoLabel.setBounds(resoArea.removeFromTop(labelHeight));
     resoSlider.setBounds(resoArea.reduced(2));
-
-    // === ENVELOPE Section ===
-    auto envelopeSection = controlsArea.removeFromLeft(sectionWidth).reduced(5);
-    envelopeSection.removeFromTop(20);
-
-    // Envelope graph at top
-    auto envGraphArea = envelopeSection.removeFromTop(60);
-    envelopeGraph.setBounds(envGraphArea.reduced(5));
-
-    // 2x2 Grid for ADSR knobs
-    int gridRowHeight = envelopeSection.getHeight() / 2;
-    int gridColWidth = envelopeSection.getWidth() / 2;
-
-    auto row1 = envelopeSection.removeFromTop(gridRowHeight);
-    auto row2 = envelopeSection;
-
-    // Attack (Row 1 Col 1)
-    auto attArea = row1.removeFromLeft(gridColWidth);
-    attackLabel.setBounds(attArea.removeFromTop(labelHeight));
-    attackSlider.setBounds(attArea.reduced(2));
-
-    // Decay (Row 1 Col 2)
-    auto decArea = row1;
-    decayLabel.setBounds(decArea.removeFromTop(labelHeight));
-    decaySlider.setBounds(decArea.reduced(2));
-
-    // Sustain (Row 2 Col 1)
-    auto susArea = row2.removeFromLeft(gridColWidth);
-    sustainLabel.setBounds(susArea.removeFromTop(labelHeight));
-    sustainSlider.setBounds(susArea.reduced(2));
-
-    // Release (Row 2 Col 2)
-    auto relArea = row2;
-    releaseLabel.setBounds(relArea.removeFromTop(labelHeight));
-    releaseSlider.setBounds(relArea.reduced(2));
-
-    // === MORPH Section (NEW - its own section) ===
-    auto morphSection = controlsArea.removeFromLeft(sectionWidth).reduced(5);
-    morphSection.removeFromTop(20);
-
-    // 2x2 Grid for morph controls
-    int morphRowHeight = morphSection.getHeight() / 2;
-    int morphColWidth = morphSection.getWidth() / 2;
-
-    auto morphRow1 = morphSection.removeFromTop(morphRowHeight);
-    auto morphRow2 = morphSection;
-
-    // Speed (Row 1 Col 1)
-    auto speedArea = morphRow1.removeFromLeft(morphColWidth);
-    morphSpeedLabel.setBounds(speedArea.removeFromTop(labelHeight));
-    morphSpeedSlider.setBounds(speedArea.reduced(2));
-
-    // Rate (Row 1 Col 2)
-    auto mRateArea = morphRow1;
-    morphRateLabel.setBounds(mRateArea.removeFromTop(labelHeight));
-    morphRateSlider.setBounds(mRateArea.reduced(2));
-
-    // Range X (Row 2 Col 1)
-    auto xArea = morphRow2.removeFromLeft(morphColWidth);
-    morphDepthXLabel.setBounds(xArea.removeFromTop(labelHeight));
-    morphDepthXSlider.setBounds(xArea.reduced(2));
-
-    // Range Y (Row 2 Col 2)
-    auto yArea = morphRow2;
-    morphDepthYLabel.setBounds(yArea.removeFromTop(labelHeight));
-    morphDepthYSlider.setBounds(yArea.reduced(2));
 
     // === MASTER Section ===
     auto masterSection = controlsArea.reduced(5);
@@ -684,25 +531,6 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
         needsRepaint = true;
     }
 
-    // Update morph cursor only if morphing is active
-    float morphSpd = audioProcessor.morphSpeed.load();
-    if (morphSpd > 0.0f)
-    {
-        float x = audioProcessor.currentX.load();
-        float y = audioProcessor.currentY.load();
-
-        static float lastX = -999.0f;
-        static float lastY = -999.0f;
-
-        if (std::abs(x - lastX) > 0.001f || std::abs(y - lastY) > 0.001f)
-        {
-            nebulaComp.setCursorPosition(x, y);
-            lastX = x;
-            lastY = y;
-            needsRepaint = true;
-        }
-    }
-
     // Update MIDI activity indicator
     static bool lastMidiActive = false;
     bool currentMidiActive = audioProcessor.isMidiActive();
@@ -736,6 +564,19 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
         yCoordLabel.setText("Y: " + juce::String(normalizedY, 3), juce::dontSendNotification);
         lastX = normalizedX;
         lastY = normalizedY;
+    }
+
+    // Update execution provider label (cheap string compare at 30fps)
+    static juce::String lastProvider;
+    juce::String currentProvider = audioProcessor.decoder.getActiveProvider();
+    if (currentProvider != lastProvider)
+    {
+        providerLabel.setText("Provider: " + currentProvider, juce::dontSendNotification);
+        if (currentProvider.startsWith("GPU"))
+            providerLabel.setColour(juce::Label::textColourId, juce::Colour(0xff4ade80));
+        else
+            providerLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
+        lastProvider = currentProvider;
     }
 }
 
@@ -781,13 +622,13 @@ void LatentAudioVSTAudioProcessorEditor::updateUIFromProcessor()
         {
             // Model successfully loaded
             modelFolderPathLabel.setText("Folder: " + folderName, juce::dontSendNotification);
-            modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+            modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
         }
         else
         {
             // Paths exist but model not loaded (needs reload)
             modelFolderPathLabel.setText("You had \"" + folderName + "\" model loaded", juce::dontSendNotification);
-            modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colours::orange);
+            modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colour(0xfff5a623));
         }
 
         modelFolderPathLabel.setTooltip(modelFolder.getFullPathName());
@@ -795,11 +636,18 @@ void LatentAudioVSTAudioProcessorEditor::updateUIFromProcessor()
     else
     {
         modelFolderPathLabel.setText("No model loaded", juce::dontSendNotification);
-        modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        modelFolderPathLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
     }
 
+    // Sync provider label
+    juce::String prov = audioProcessor.decoder.getActiveProvider();
+    providerLabel.setText("Provider: " + prov, juce::dontSendNotification);
+    if (prov.startsWith("GPU"))
+        providerLabel.setColour(juce::Label::textColourId, juce::Colour(0xff4ade80));
+    else
+        providerLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8888aa));
+
     filterGraph.repaint();
-    envelopeGraph.repaint();
 }
 
 void LatentAudioVSTAudioProcessorEditor::buttonClicked(juce::Button* button)

@@ -37,6 +37,7 @@ class LatentDecoder
 {
 public:
     static std::map<std::string, std::shared_ptr<Ort::Session>> sharedSessions;
+    static std::map<std::string, std::string> sharedProviders; // path -> "CPU" / "GPU: CUDA" / "GPU: DML"
     static std::shared_ptr<Ort::Env> sharedEnv;
     static std::mutex sharedMutex;
     static std::atomic<int> instanceCount;
@@ -58,6 +59,10 @@ public:
 
     int getExpectedLatentDim() const { return latentDim; }
 
+    // Returns which execution provider the active session was created with.
+    // "None" = no model loaded, "CPU", "GPU: CUDA", "GPU: DML"
+    juce::String getActiveProvider() const { return activeProvider; }
+
     // Manual unload functionality
     static bool unloadModelFromCache(const juce::String& modelPath);
     static std::vector<juce::String> getLoadedModels();
@@ -66,7 +71,10 @@ public:
 private:
     std::shared_ptr<Ort::Env> env;
     std::shared_ptr<Ort::Session> session;
-    
+
+    // Which execution provider this instance's session was created with
+    juce::String activeProvider { "None" };
+
     // Model Info
     int latentDim = 128;
     

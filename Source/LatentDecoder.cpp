@@ -19,6 +19,7 @@
 
 // Static members
 std::map<std::string, std::shared_ptr<Ort::Session>> LatentDecoder::sharedSessions;
+std::map<std::string, std::string> LatentDecoder::sharedProviders;
 std::shared_ptr<Ort::Env> LatentDecoder::sharedEnv;
 std::mutex LatentDecoder::sharedMutex;
 std::atomic<int> LatentDecoder::instanceCount{ 0 };
@@ -47,6 +48,7 @@ LatentDecoder::~LatentDecoder()
         std::lock_guard<std::mutex> lock(sharedMutex);
         juce::Logger::writeToLog("[LatentDecoder] Last instance - clearing shared sessions, cache size: " + juce::String((int)sharedSessions.size()));
         sharedSessions.clear();
+        sharedProviders.clear();
         sharedEnv.reset();
         juce::Logger::writeToLog("[LatentDecoder] Shared sessions and env cleared");
     }
@@ -69,112 +71,170 @@ bool LatentDecoder::loadModel(const juce::File& modelFile)
         return false;
     }
 
+    std::string  modelPathStr = modelFile.getFullPathName().toStdString();
+    std::wstring modelPathW   = modelFile.getFullPathName().toWideCharPointer();
+
+    // Helper: build fresh SessionOptions with common base settings.
+    // Must be called fresh for each provider attempt — a partially-configured
+    // SessionOptions after a failed AppendExecutionProvider is not reusable.
+    auto makeBaseOptions = []() -> Ort::SessionOptions
+    {
+        Ort::SessionOptions opts;
+        opts.SetIntraOpNumThreads(1);
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+        return opts;
+    };
+
     try
     {
-        Ort::SessionOptions sessionOptions;
-        sessionOptions.SetIntraOpNumThreads(1);
-        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-
-        // Convert path to string
-        std::string modelPathStr = modelFile.getFullPathName().toStdString();
-
-        std::shared_ptr<Ort::Session> targetSession;
         Ort::AllocatorWithDefaultOptions allocator;
-        size_t numInputNodes, numOutputNodes;
+        std::shared_ptr<Ort::Session> targetSession;
+        std::string chosenProvider;
 
-        // Check shared sessions
-        juce::Logger::writeToLog("[LatentDecoder::loadModel] Checking shared sessions cache...");
+        // ---- Check shared session cache (holds lock for entire probe) ----
         {
             std::lock_guard<std::mutex> lock(sharedMutex);
             juce::Logger::writeToLog("[LatentDecoder::loadModel] Cache size: " + juce::String((int)sharedSessions.size()));
-            juce::Logger::writeToLog("[LatentDecoder::loadModel] sharedEnv=" + juce::String(sharedEnv ? "VALID" : "NULL"));
 
             auto it = sharedSessions.find(modelPathStr);
             if (it != sharedSessions.end())
             {
+                // Cache hit: reuse session and restore the recorded provider
                 juce::Logger::writeToLog("[LatentDecoder::loadModel] CACHE HIT - reusing existing session");
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] Cached session ptr=" + juce::String::toHexString((juce::int64)it->second.get()));
                 session = it->second;
-                targetSession = session;
-                env = sharedEnv;
-                // Get input/output names from existing session
-                numInputNodes = session->GetInputCount();
-                numOutputNodes = session->GetOutputCount();
-                // Populate names
-                inputNodeNames.clear();
-                inputNodeNameStrings.clear();
-                for (size_t i = 0; i < numInputNodes; i++)
+                env     = sharedEnv;
+
+                auto pit = sharedProviders.find(modelPathStr);
+                activeProvider = (pit != sharedProviders.end())
+                                 ? juce::String(pit->second) : "CPU";
+
+                size_t numIn  = session->GetInputCount();
+                size_t numOut = session->GetOutputCount();
+                inputNodeNames.clear();  inputNodeNameStrings.clear();
+                for (size_t i = 0; i < numIn; ++i)
                 {
                     auto name = session->GetInputNameAllocated(i, allocator);
                     inputNodeNameStrings.push_back(name.get());
                     inputNodeNames.push_back(inputNodeNameStrings.back().c_str());
                 }
-                outputNodeNames.clear();
-                outputNodeNameStrings.clear();
-                for (size_t i = 0; i < numOutputNodes; i++)
+                outputNodeNames.clear(); outputNodeNameStrings.clear();
+                for (size_t i = 0; i < numOut; ++i)
                 {
                     auto name = session->GetOutputNameAllocated(i, allocator);
                     outputNodeNameStrings.push_back(name.get());
                     outputNodeNames.push_back(outputNodeNameStrings.back().c_str());
                 }
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] CACHE HIT SUCCESS");
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] CACHE HIT SUCCESS, provider=" + activeProvider);
                 return true;
             }
-            else
+
+            // Cache miss — ensure shared Env exists
+            if (!sharedEnv)
             {
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] CACHE MISS - creating new session");
-
-                // Create shared env if needed
-                if (!sharedEnv)
-                {
-                    juce::Logger::writeToLog("[LatentDecoder::loadModel] Creating new shared Ort::Env");
-                    sharedEnv = std::make_shared<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "LatentAudioVST");
-                }
-
-                env = sharedEnv;
-
-                // Load new session
-                // Convert path to wstring for Windows
-                std::wstring modelPathW = modelFile.getFullPathName().toWideCharPointer();
-
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] Creating new Ort::Session...");
-                auto newSession = std::make_shared<Ort::Session>(*env, modelPathW.c_str(), sessionOptions);
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] New session created, ptr=" + juce::String::toHexString((juce::int64)newSession.get()));
-
-                sharedSessions[modelPathStr] = newSession;
-                session = newSession;
-                targetSession = newSession;
-
-                // Get input/output names for new session
-                numInputNodes = targetSession->GetInputCount();
-                numOutputNodes = targetSession->GetOutputCount();
-
-                juce::Logger::writeToLog("[LatentDecoder::loadModel] Session added to cache, new cache size: " + juce::String((int)sharedSessions.size()));
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] Creating new shared Ort::Env");
+                sharedEnv = std::make_shared<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "LatentAudioVST");
             }
-        }
+            env = sharedEnv;
 
-        // Populate names for new session
-        inputNodeNames.clear();
-        inputNodeNameStrings.clear();
+            // ---- Provider probe: CUDA -> DirectML -> CPU ----------------
+            // Each attempt uses freshly constructed SessionOptions so a failed
+            // append on one attempt doesn't poison the next attempt's options.
 
-        for (size_t i = 0; i < numInputNodes; i++)
+            // Attempt 1: CUDA (NVIDIA GPU — requires onnxruntime_providers_cuda.dll)
+            {
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] Trying CUDA provider...");
+                try
+                {
+                    Ort::SessionOptions cudaOpts = makeBaseOptions();
+                    OrtCUDAProviderOptions cudaProvOpts{};
+                    cudaProvOpts.device_id = 0;
+                    cudaOpts.AppendExecutionProvider_CUDA(cudaProvOpts);
+                    targetSession  = std::make_shared<Ort::Session>(*env, modelPathW.c_str(), cudaOpts);
+                    chosenProvider = "GPU: CUDA";
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] CUDA provider: SUCCESS");
+                }
+                catch (const Ort::Exception& e)
+                {
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] CUDA provider: unavailable (" + juce::String(e.what()) + ")");
+                    targetSession.reset();
+                }
+                catch (...)
+                {
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] CUDA provider: unavailable (unknown error)");
+                    targetSession.reset();
+                }
+            }
+
+            // Attempt 2: DirectML (any Windows GPU/iGPU — requires onnxruntime_providers_dml.dll)
+            if (!targetSession)
+            {
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] Trying DirectML provider...");
+                try
+                {
+                    Ort::SessionOptions dmlOpts = makeBaseOptions();
+                    // DML requires sequential execution and disabled memory pattern optimisation
+                    dmlOpts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+                    dmlOpts.DisableMemPattern();
+                    dmlOpts.AppendExecutionProvider("DML", { {"device_id", "0"} });
+                    targetSession  = std::make_shared<Ort::Session>(*env, modelPathW.c_str(), dmlOpts);
+                    chosenProvider = "GPU: DML";
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] DirectML provider: SUCCESS");
+                }
+                catch (const Ort::Exception& e)
+                {
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] DirectML provider: unavailable (" + juce::String(e.what()) + ")");
+                    targetSession.reset();
+                }
+                catch (...)
+                {
+                    juce::Logger::writeToLog("[LatentDecoder::loadModel] DirectML provider: unavailable (unknown error)");
+                    targetSession.reset();
+                }
+            }
+
+            // Attempt 3: CPU (always available — may throw only if model file is corrupt)
+            if (!targetSession)
+            {
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] Using CPU provider (fallback)");
+                Ort::SessionOptions cpuOpts = makeBaseOptions();
+                targetSession  = std::make_shared<Ort::Session>(*env, modelPathW.c_str(), cpuOpts);
+                chosenProvider = "CPU";
+                juce::Logger::writeToLog("[LatentDecoder::loadModel] CPU provider: SUCCESS");
+            }
+
+            // Commit both session and provider to the shared cache atomically
+            sharedSessions[modelPathStr]  = targetSession;
+            sharedProviders[modelPathStr] = chosenProvider;
+            session = targetSession;
+
+            juce::Logger::writeToLog("[LatentDecoder::loadModel] Session cached, provider=" + juce::String(chosenProvider));
+        } // lock released
+
+        activeProvider = juce::String(chosenProvider);
+
+        // Populate node names for the new session (outside lock — read-only on targetSession)
+        size_t numIn  = targetSession->GetInputCount();
+        size_t numOut = targetSession->GetOutputCount();
+
+        inputNodeNames.clear();  inputNodeNameStrings.clear();
+        for (size_t i = 0; i < numIn; ++i)
         {
             auto name = targetSession->GetInputNameAllocated(i, allocator);
             inputNodeNameStrings.push_back(name.get());
             inputNodeNames.push_back(inputNodeNameStrings.back().c_str());
         }
-
-        outputNodeNames.clear();
-        outputNodeNameStrings.clear();
-
-        for (size_t i = 0; i < numOutputNodes; i++)
+        outputNodeNames.clear(); outputNodeNameStrings.clear();
+        for (size_t i = 0; i < numOut; ++i)
         {
             auto name = targetSession->GetOutputNameAllocated(i, allocator);
             outputNodeNameStrings.push_back(name.get());
             outputNodeNames.push_back(outputNodeNameStrings.back().c_str());
         }
 
-        juce::Logger::writeToLog("[LatentDecoder::loadModel] SUCCESS: Model loaded, latentDim=" + juce::String(latentDim) + ", inputNodes=" + juce::String(numInputNodes) + ", outputNodes=" + juce::String(numOutputNodes));
+        juce::Logger::writeToLog("[LatentDecoder::loadModel] SUCCESS: provider=" + activeProvider
+            + ", latentDim=" + juce::String(latentDim)
+            + ", inputNodes=" + juce::String((int)numIn)
+            + ", outputNodes=" + juce::String((int)numOut));
         return true;
     }
     catch (const Ort::Exception& e)
@@ -186,12 +246,9 @@ bool LatentDecoder::loadModel(const juce::File& modelFile)
 
 bool LatentDecoder::decode(const std::vector<float>& latentVector, std::vector<float>& audioOutput)
 {
-    juce::Logger::writeToLog("[LatentDecoder::decode] Called with latentVector.size()=" + juce::String(latentVector.size()) + ", expected latentDim=" + juce::String(latentDim));
-    juce::Logger::writeToLog("[LatentDecoder::decode] session is " + juce::String(session ? "VALID" : "NULL"));
-
     if (!session || latentVector.size() != static_cast<size_t> (latentDim))
     {
-        juce::Logger::writeToLog("[LatentDecoder::decode] FAIL: session null or latentVector size mismatch");
+        juce::Logger::writeToLog("[LatentDecoder::decode] FAIL: session null or latentVector size mismatch (dim=" + juce::String(latentDim) + ")");
         return false;
     }
 
@@ -233,7 +290,7 @@ bool LatentDecoder::decode(const std::vector<float>& latentVector, std::vector<f
         // Copy data
         std::memcpy(audioOutput.data(), floatArr, outputSize * sizeof(float));
 
-        juce::Logger::writeToLog("[LatentDecoder::decode] SUCCESS: Generated audio with " + juce::String(outputSize) + " samples");
+        // Success - don't log here (called on inference thread every inference, log = file I/O = latency)
         return true;
     }
     catch (const Ort::Exception& e)
@@ -260,6 +317,7 @@ bool LatentDecoder::unloadModelFromCache(const juce::String& modelPath)
         juce::Logger::writeToLog("[LatentDecoder::unloadModelFromCache] Cache size before: " + juce::String((int)sharedSessions.size()));
 
         sharedSessions.erase(it);
+        sharedProviders.erase(modelPathStr); // keep companion map in sync
 
         juce::Logger::writeToLog("[LatentDecoder::unloadModelFromCache] Cache size after: " + juce::String((int)sharedSessions.size()));
         return true;

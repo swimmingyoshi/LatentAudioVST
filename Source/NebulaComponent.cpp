@@ -31,27 +31,97 @@ NebulaComponent::~NebulaComponent()
 
 void NebulaComponent::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colours::black);
+    auto w      = (float) getWidth();
+    auto h      = (float) getHeight();
+    auto bounds = getLocalBounds().toFloat();
 
-    // Draw Points
-    g.setColour (juce::Colours::cyan.withAlpha (0.6f));
-    const auto& points = soundMap.getPoints();
+    // ── Background ──────────────────────────────────────────────────────────
+    g.fillAll (juce::Colour (0xff0d0d1a));
 
-    for (const auto& p : points)
+    // Subtle radial vignette (slightly darker at corners)
     {
-        auto pt = mapToScreen (p.x, p.y);
-        if (isfinite(pt.x) && isfinite(pt.y))
-            g.fillEllipse (pt.x - 2.0f, pt.y - 2.0f, 4.0f, 4.0f);
+        juce::ColourGradient vig (juce::Colours::transparentBlack, w * 0.5f, h * 0.5f,
+                                   juce::Colour (0x55000000), 0.0f, 0.0f, true);
+        g.setGradientFill (vig);
+        g.fillRect (bounds);
     }
 
-    // Draw Cursor
-    auto cursorPt = mapToScreen (cursorX, cursorY);
-    if (isfinite(cursorPt.x) && isfinite(cursorPt.y))
+    // Fine dot-grid
+    g.setColour (juce::Colour (0xff1a1a30));
+    for (float gx = 0.0f; gx < w; gx += 28.0f)
+        for (float gy = 0.0f; gy < h; gy += 28.0f)
+            g.fillRect (gx, gy, 1.0f, 1.0f);
+
+    // Border
+    g.setColour (juce::Colour (0xff2a2a4a));
+    g.drawRect (bounds, 1.0f);
+
+    // ── Sound Points ─────────────────────────────────────────────────────────
+    const auto& points = soundMap.getPoints();
+
+    if (points.empty())
     {
-        g.setColour (juce::Colours::yellow);
-        g.drawEllipse (cursorPt.x - 8.0f, cursorPt.y - 8.0f, 16.0f, 16.0f, 2.0f);
-        g.drawLine (cursorPt.x, cursorPt.y - 10.0f, cursorPt.x, cursorPt.y + 10.0f, 2.0f);
-        g.drawLine (cursorPt.x - 10.0f, cursorPt.y, cursorPt.x + 10.0f, cursorPt.y, 2.0f);
+        g.setFont (juce::Font (14.0f));
+        g.setColour (juce::Colour (0xff333355));
+        g.drawFittedText ("Load a model folder to explore the sound space",
+                          getLocalBounds().reduced (20), juce::Justification::centred, 2);
+    }
+    else
+    {
+        for (const auto& p : points)
+        {
+            auto pt = mapToScreen (p.x, p.y);
+            if (!std::isfinite (pt.x) || !std::isfinite (pt.y)) continue;
+
+            // Soft radial glow
+            float glowR = 9.0f;
+            juce::ColourGradient glow (juce::Colour (0x4038bdf8), pt.x, pt.y,
+                                        juce::Colours::transparentBlack,
+                                        pt.x + glowR, pt.y, true);
+            g.setGradientFill (glow);
+            g.fillEllipse (pt.x - glowR, pt.y - glowR, glowR * 2.0f, glowR * 2.0f);
+
+            // Core dot
+            g.setColour (juce::Colour (0xff38bdf8).withAlpha (0.75f));
+            g.fillEllipse (pt.x - 2.0f, pt.y - 2.0f, 4.0f, 4.0f);
+        }
+    }
+
+    // ── Cursor ────────────────────────────────────────────────────────────────
+    auto cursorPt = mapToScreen (cursorX, cursorY);
+    if (std::isfinite (cursorPt.x) && std::isfinite (cursorPt.y))
+    {
+        constexpr float ringR  = 9.0f;
+        constexpr float glowR  = 20.0f;
+        constexpr float lineIn = 12.0f;  // gap from centre
+        constexpr float lineOut = 20.0f; // end of crosshair arm
+        float cx = cursorPt.x, cy = cursorPt.y;
+
+        // Wide ambient glow
+        {
+            juce::ColourGradient glow (juce::Colour (0x28f5a623), cx, cy,
+                                        juce::Colours::transparentBlack,
+                                        cx + glowR, cy, true);
+            g.setGradientFill (glow);
+            g.fillEllipse (cx - glowR, cy - glowR, glowR * 2.0f, glowR * 2.0f);
+        }
+
+        // Outer dim ring
+        g.setColour (juce::Colour (0x40f5a623));
+        g.drawEllipse (cx - 14.0f, cy - 14.0f, 28.0f, 28.0f, 1.0f);
+
+        // Main ring
+        g.setColour (juce::Colour (0xfff5a623));
+        g.drawEllipse (cx - ringR, cy - ringR, ringR * 2.0f, ringR * 2.0f, 1.5f);
+
+        // Gap crosshair (lines start outside the ring)
+        g.drawLine (cx,         cy - lineOut, cx,         cy - lineIn,  1.5f);
+        g.drawLine (cx,         cy + lineIn,  cx,         cy + lineOut, 1.5f);
+        g.drawLine (cx - lineOut, cy,         cx - lineIn, cy,           1.5f);
+        g.drawLine (cx + lineIn,  cy,         cx + lineOut, cy,          1.5f);
+
+        // Centre dot
+        g.fillEllipse (cx - 2.0f, cy - 2.0f, 4.0f, 4.0f);
     }
 }
 

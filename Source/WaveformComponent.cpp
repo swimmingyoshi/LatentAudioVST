@@ -28,66 +28,94 @@ WaveformComponent::~WaveformComponent()
 
 void WaveformComponent::paint(juce::Graphics& g)
 {
-    g.fillAll(juce::Colours::black.withAlpha(0.3f));
+    auto w       = (float)getWidth();
+    auto h       = (float)getHeight();
+    auto bounds  = getLocalBounds().toFloat();
+    auto centerY = h * 0.5f;
+    auto scaleY  = h * 0.45f;
 
-    g.setColour(juce::Colours::cyan);
-    g.drawRect(getLocalBounds(), 1);
+    // Background
+    g.setColour(juce::Colour(0xff0d0d1a));
+    g.fillRect(bounds);
+
+    // Centre line
+    g.setColour(juce::Colour(0xff1a1a30));
+    g.drawLine(0.0f, centerY, w, centerY, 0.5f);
+
+    // Border
+    g.setColour(juce::Colour(0xff2a2a4a));
+    g.drawRect(bounds, 1.0f);
 
     if (waveform.empty())
+    {
+        g.setColour(juce::Colour(0xff333355));
+        g.setFont(juce::Font(11.0f));
+        g.drawFittedText("No waveform", getLocalBounds(), juce::Justification::centred, 1);
         return;
-
-    auto w = (float)getWidth();
-    auto h = (float)getHeight();
-    auto centerY = h * 0.5f;
-    auto scaleY = h * 0.45f;
-
-    juce::Path path;
-    path.startNewSubPath(0.0f, centerY);
+    }
 
     int step = 1;
     if (waveform.size() > (size_t)w)
         step = (int)(waveform.size() / w);
 
+    // Build paths
+    juce::Path strokePath, fillPath;
+    fillPath.startNewSubPath(0.0f, centerY);
+    strokePath.startNewSubPath(0.0f, centerY);
+
     for (size_t i = 0; i < waveform.size(); i += step)
     {
         float x = (float)i / (float)waveform.size() * w;
         float y = centerY - (waveform[i] * scaleY);
-        path.lineTo(x, y);
+        fillPath.lineTo(x, y);
+        strokePath.lineTo(x, y);
     }
+    fillPath.lineTo(w, centerY);
+    fillPath.closeSubPath();
 
-    g.strokePath(path, juce::PathStrokeType(1.5f));
+    // Gradient fill
+    juce::ColourGradient waveGrad(juce::Colour(0x5538bdf8), 0.0f, 0.0f,
+                                   juce::Colours::transparentBlack, 0.0f, h, false);
+    g.setGradientFill(waveGrad);
+    g.fillPath(fillPath);
 
-    // Draw Sample Start Indicator
+    // Stroke
+    g.setColour(juce::Colour(0xff38bdf8).withAlpha(0.9f));
+    g.strokePath(strokePath, juce::PathStrokeType(1.5f));
+
+    // Sample Start marker
     if (startPos > 0.0f)
     {
         float startX = startPos * w;
-        g.setColour(juce::Colours::green.withAlpha(0.6f));
-        g.drawLine(startX, 0.0f, startX, h, 2.0f);
+        g.setColour(juce::Colour(0xff4ade80).withAlpha(0.8f));
+        g.drawLine(startX, 0.0f, startX, h, 1.5f);
     }
 
-    // Draw Loop Length Indicator
+    // Loop Length marker
     if (loopLen > 0.0f && loopLen < 1.0f)
     {
         float loopX = loopLen * w;
-        g.setColour(juce::Colours::yellow.withAlpha(0.6f));
-        g.drawLine(loopX, 0.0f, loopX, h, 2.0f);
+        g.setColour(juce::Colour(0xfff5a623).withAlpha(0.75f));
+        g.drawLine(loopX, 0.0f, loopX, h, 1.5f);
 
-        // Optional: shade the played portion
         if (startPos < loopLen)
         {
-            g.setColour(juce::Colours::yellow.withAlpha(0.1f));
-            g.fillRect(startPos * w, 0.0f, (loopX - startPos * w), h);
+            g.setColour(juce::Colour(0xfff5a623).withAlpha(0.07f));
+            g.fillRect(startPos * w, 0.0f, loopX - startPos * w, h);
         }
     }
 
-
-
-    // Draw Playhead
+    // Playhead
     if (playbackPos >= 0.0f && playbackPos <= 1.0f)
     {
         float x = playbackPos * w;
-        g.setColour(juce::Colours::white.withAlpha(0.8f));
-        g.drawLine(x, 0.0f, x, h, 2.0f);
+        g.setColour(juce::Colour(0xffffffff).withAlpha(0.9f));
+        g.drawLine(x, 0.0f, x, h, 1.5f);
+
+        // Small downward triangle at top
+        juce::Path arrow;
+        arrow.addTriangle(x - 4.0f, 0.0f, x + 4.0f, 0.0f, x, 5.0f);
+        g.fillPath(arrow);
     }
 }
 

@@ -21,6 +21,7 @@
 #include "PluginProcessor.h"
 #include "NebulaComponent.h"
 #include "WaveformComponent.h"
+#include "LatentLookAndFeel.h"
 
 //==============================================================================
 class LatentAudioVSTAudioProcessorEditor : public juce::AudioProcessorEditor,
@@ -63,31 +64,6 @@ private:
     juce::Slider resoSlider;
     juce::Label resoLabel;
 
-    // ENVELOPE Section (Full ADSR)
-    juce::Slider attackSlider;
-    juce::Label attackLabel;
-
-    juce::Slider decaySlider;
-    juce::Label decayLabel;
-
-    juce::Slider sustainSlider;
-    juce::Label sustainLabel;
-
-    juce::Slider releaseSlider;
-    juce::Label releaseLabel;
-
-    // MORPH Section (Now its own section)
-    juce::Slider morphSpeedSlider;
-    juce::Label morphSpeedLabel;
-
-    juce::Slider morphRateSlider;
-    juce::Label morphRateLabel;
-
-    juce::Slider morphDepthXSlider;
-    juce::Label morphDepthXLabel;
-
-    juce::Slider morphDepthYSlider;
-    juce::Label morphDepthYLabel;
 
     // MASTER Section
     juce::Slider gainSlider;
@@ -123,14 +99,6 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> resoAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attackAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> decayAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sustainAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> releaseAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> morphSpeedAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> morphRateAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> morphDepthXAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> morphDepthYAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> mixAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
@@ -150,9 +118,9 @@ private:
     // Coordinate display
     juce::Label xCoordLabel;
     juce::Label yCoordLabel;
+    juce::Label providerLabel; // shows "CPU" / "GPU: CUDA" / "GPU: DML"
     std::unique_ptr<juce::FileChooser> fileChooser;
 
-    void updateEnvelope();
     void timerCallback() override;
     void resetAllKnobs();
     void buttonClicked(juce::Button* button) override;
@@ -166,100 +134,50 @@ private:
         {
             auto w = (float)getWidth();
             auto h = (float)getHeight();
-
             if (w <= 0.0f || h <= 0.0f) return;
 
-            g.fillAll(juce::Colours::black.withAlpha(0.3f));
+            auto bounds = getLocalBounds().toFloat();
+
+            // Background
+            g.setColour(juce::Colour(0xff0d0d1a));
+            g.fillRoundedRectangle(bounds, 4.0f);
+
+            // Grid lines
+            g.setColour(juce::Colour(0xff1a1a30));
+            for (float fx = w * 0.25f; fx < w; fx += w * 0.25f)
+                g.drawLine(fx, 0.0f, fx, h, 0.5f);
+            g.drawLine(0.0f, h * 0.5f, w, h * 0.5f, 0.5f);
 
             float cutoff = processor.lpCutoff.load();
-            float reso = processor.lpReso.load();
+            float reso   = processor.lpReso.load();
 
-            g.setColour(juce::Colours::cyan);
-            juce::Path p;
-
+            juce::Path freqPath;
             for (int i = 0; i < (int)w; i += 2)
             {
-                float x = (float)i;
-                float normX = x / w;
-                float freq = 20.0f * std::pow(1000.0f, normX);
-
+                float x     = (float)i;
+                float freq  = 20.0f * std::pow(1000.0f, x / w);
                 float ratio = freq / cutoff;
-                float mag1 = 1.0f / std::sqrt(1.0f + std::pow(ratio, 4.0f) - reso * 0.5f);
-                float magTotal = mag1 * mag1;
-
-                float y = h - (magTotal * h);
-
-                if (i == 0) p.startNewSubPath(x, y);
-                else p.lineTo(x, y);
+                float mag   = 1.0f / std::sqrt(1.0f + std::pow(ratio, 4.0f) - reso * 0.5f);
+                float y     = h - (mag * h * 0.9f);
+                if (i == 0) freqPath.startNewSubPath(x, y);
+                else        freqPath.lineTo(x, y);
             }
-            g.strokePath(p, juce::PathStrokeType(1.5f));
-        }
-    private:
-        LatentAudioVSTAudioProcessor& processor;
-    };
 
-    // Envelope Visualization
-    class EnvelopeGraph : public juce::Component
-    {
-    public:
-        EnvelopeGraph(LatentAudioVSTAudioProcessor& p) : processor(p) {}
+            // Gradient fill under curve
+            juce::Path fillPath = freqPath;
+            fillPath.lineTo(w, h); fillPath.lineTo(0.0f, h); fillPath.closeSubPath();
+            juce::ColourGradient fillGrad(juce::Colour(0x3038bdf8), 0.0f, 0.0f,
+                                           juce::Colours::transparentBlack, 0.0f, h, false);
+            g.setGradientFill(fillGrad);
+            g.fillPath(fillPath);
 
-        void paint(juce::Graphics& g) override
-        {
-            auto w = (float)getWidth();
-            auto h = (float)getHeight();
+            // Stroke
+            g.setColour(juce::Colour(0xff38bdf8).withAlpha(0.9f));
+            g.strokePath(freqPath, juce::PathStrokeType(1.5f));
 
-            if (w <= 0.0f || h <= 0.0f) return;
-
-            g.fillAll(juce::Colours::black.withAlpha(0.3f));
-
-            float attack = processor.attackTime.load();
-            float decay = processor.decayTime.load();
-            float sustain = processor.sustainLevel.load();
-            float release = processor.releaseTime.load();
-
-            // Calculate time scaling
-            float totalTime = attack + decay + 0.5f + release;
-            float scale = w / totalTime;
-
-            // Build envelope path
-            juce::Path envPath;
-
-            float x = 0.0f;
-            float y = h;
-            envPath.startNewSubPath(x, y);
-
-            // Attack
-            x += attack * scale;
-            y = 0.0f;
-            envPath.lineTo(x, y);
-
-            // Decay
-            x += decay * scale;
-            y = h * (1.0f - sustain);
-            envPath.lineTo(x, y);
-
-            // Sustain
-            x += 0.5f * scale;
-            envPath.lineTo(x, y);
-
-            // Release
-            x += release * scale;
-            y = h;
-            envPath.lineTo(x, y);
-
-            g.setColour(juce::Colours::lime);
-            g.strokePath(envPath, juce::PathStrokeType(2.0f));
-
-            // Draw stage labels
-            g.setFont(10.0f);
-            g.setColour(juce::Colours::white.withAlpha(0.6f));
-
-            float labelY = h - 12.0f;
-            g.drawText("A", 2, (int)labelY, 20, 12, juce::Justification::left);
-            g.drawText("D", (int)(attack * scale) + 2, (int)labelY, 20, 12, juce::Justification::left);
-            g.drawText("S", (int)((attack + decay) * scale) + 2, (int)labelY, 20, 12, juce::Justification::left);
-            g.drawText("R", (int)((attack + decay + 0.5f) * scale) + 2, (int)labelY, 20, 12, juce::Justification::left);
+            // Border
+            g.setColour(juce::Colour(0xff2a2a4a));
+            g.drawRoundedRectangle(bounds.reduced(0.5f), 4.0f, 1.0f);
         }
     private:
         LatentAudioVSTAudioProcessor& processor;
@@ -275,14 +193,25 @@ private:
         {
             auto bounds = getLocalBounds().toFloat().reduced(2.0f);
 
-            g.setColour(juce::Colours::darkgrey);
+            // Dark base circle
+            g.setColour(juce::Colour(0xff141428));
             g.fillEllipse(bounds);
+            g.setColour(juce::Colour(0xff2a2a4a));
+            g.drawEllipse(bounds, 1.0f);
 
             if (processor.isMidiActive())
             {
+                // Outer glow
+                juce::ColourGradient glow(juce::Colour(0x604ade80),
+                                          bounds.getCentreX(), bounds.getCentreY(),
+                                          juce::Colours::transparentBlack,
+                                          bounds.getRight(), bounds.getCentreY(), true);
+                g.setGradientFill(glow);
+                g.fillEllipse(bounds.expanded(3.0f));
 
-                g.setColour(juce::Colours::lime);
-                g.fillEllipse(bounds.reduced(1.0f));
+                // Core
+                g.setColour(juce::Colour(0xff4ade80));
+                g.fillEllipse(bounds.reduced(2.0f));
             }
         }
 
@@ -291,8 +220,9 @@ private:
     };
 
     FilterGraph filterGraph;
-    EnvelopeGraph envelopeGraph;
     MidiActivityIndicator midiIndicator;
+
+    LatentLookAndFeel laf;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LatentAudioVSTAudioProcessorEditor)
 };

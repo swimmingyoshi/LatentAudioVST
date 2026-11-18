@@ -43,6 +43,16 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
 
     inferenceThread.onInferenceFinished = [this](const std::vector<float>& rawAudio)
         {
+            // Skip async results in offline/export mode - sync decode handles it there
+            if (isOfflineMode.load())
+                return;
+
+            // Discard any inference that was in-flight during a model switch.
+            // loadModelFolder sets this flag true before clearing state, and clears
+            // it only after everything (buffers, session, soundmap) is settled.
+            if (modelSwitchPending.load())
+                return;
+
             // juce::Logger::writeToLog("[InferenceFinished] Received " + juce::String(rawAudio.size()) + " samples");
 
             if (rawAudio.empty())
@@ -127,8 +137,13 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
                 // juce::Logger::writeToLog("[InferenceFinished] Copied to buffer " + juce::String(backIndex));
             }
 
-            // Start playback if not already playing
-            if (playbackPosition.load() < 0)
+            // Start playback fresh if:
+            //   (a) not playing at all (playbackPosition < 0), OR
+            //   (b) playbackPosition was bumped to 0 by triggerInference but
+            //       hasValidAudio is still false (e.g. after a model switch reset).
+            //       In that case the active buffer is empty; a crossfade would
+            //       immediately hit totalGenerated==0 and return silently.
+            if (playbackPosition.load() < 0 || !hasValidAudio.load())
             {
                 playbackPosition.store(0);
                 fractionalPosition = 0.0f;
@@ -136,10 +151,9 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
                 int backIndex = 1 - activeBufferIndex.load();
                 activeBufferIndex.store(backIndex);
                 triggerCrossfade.store(false);
+                isCrossfading = false;
 
                 hasValidAudio.store(true);  // Mark that we have audio
-
-                // juce::Logger::writeToLog("[InferenceFinished] Started playback on buffer " + juce::String(backIndex));
             }
 
             // Update waveform display
@@ -176,40 +190,6 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         "filterResonance", "Filter Resonance",
         juce::NormalisableRange<float>(0.0f, 1.0f), 0.0f));
-
-    // Envelope
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "attackTime", "Attack Time (sec)",
-        juce::NormalisableRange<float>(0.001f, 2.0f), 0.01f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "decayTime", "Decay Time (sec)",
-        juce::NormalisableRange<float>(0.001f, 2.0f), 0.1f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "sustainLevel", "Sustain Level",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 0.7f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "releaseTime", "Release Time (sec)",
-        juce::NormalisableRange<float>(0.01f, 5.0f), 0.5f));
-
-    // Morph
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "morphSpeed", "Morph Speed",
-        juce::NormalisableRange<float>(0.0f, 5.0f), 0.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "morphRate", "Morph Rate (Hz)",
-        juce::NormalisableRange<float>(0.1f, 20.0f), 2.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "morphDepthX", "Morph Depth X",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "morphDepthY", "Morph Depth Y",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
 
     // Master
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -264,14 +244,6 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     parameters->addParameterListener("crossfade", this);
     parameters->addParameterListener("filterCutoff", this);
     parameters->addParameterListener("filterResonance", this);
-    parameters->addParameterListener("attackTime", this);
-    parameters->addParameterListener("decayTime", this);
-    parameters->addParameterListener("sustainLevel", this);
-    parameters->addParameterListener("releaseTime", this);
-    parameters->addParameterListener("morphSpeed", this);
-    parameters->addParameterListener("morphRate", this);
-    parameters->addParameterListener("morphDepthX", this);
-    parameters->addParameterListener("morphDepthY", this);
     parameters->addParameterListener("outputGain", this);
     parameters->addParameterListener("mixAmount", this);
     parameters->addParameterListener("sampleLength", this);
@@ -319,22 +291,6 @@ void LatentAudioVSTAudioProcessor::parameterChanged(const juce::String& paramete
         setFilterCutoff(newValue);
     else if (parameterID == "filterResonance")
         setFilterResonance(newValue);
-    else if (parameterID == "attackTime")
-        attackTime.store(newValue);
-    else if (parameterID == "decayTime")
-        decayTime.store(newValue);
-    else if (parameterID == "sustainLevel")
-        sustainLevel.store(newValue);
-    else if (parameterID == "releaseTime")
-        releaseTime.store(newValue);
-    else if (parameterID == "morphSpeed")
-        setMorphSpeed(newValue);
-    else if (parameterID == "morphRate")
-        setMorphRate(newValue);
-    else if (parameterID == "morphDepthX")
-        setMorphDepthX(newValue);
-    else if (parameterID == "morphDepthY")
-        setMorphDepthY(newValue);
     else if (parameterID == "outputGain")
         setGain(newValue); // Already linear, no need for dB conversion
     else if (parameterID == "mixAmount")
@@ -438,6 +394,19 @@ void LatentAudioVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesP
     isOfflineMode.store(isNonRealtime());
     lastOfflineX = -999.0f;  // Reset offline position tracking
     lastOfflineY = -999.0f;
+
+    // When entering offline (export) mode, reset to a clean state so the export
+    // starts from scratch rather than mid-crossfade from the realtime session.
+    if (isOfflineMode.load())
+    {
+        playbackPosition.store(-1);
+        envState = EnvelopeState::Idle;
+        currentEnvLevel = 0.0f;
+        fractionalPosition = 0.0f;
+        isCrossfading = false;
+        triggerCrossfade.store(false);
+        hasValidAudio.store(false);
+    }
 
     // Pre-allocate buffers for synchronous inference in offline mode
     if (isOfflineMode.load())
@@ -593,22 +562,9 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
                     currentY.store(y);
                 }
 
-                triggerInference(x, y);
-
-                int maxWaitMs = 5000;
-                int waitedMs = 0;
-                while (!hasValidAudio.load() && waitedMs < maxWaitMs)
-                {
-                    juce::Thread::sleep(50);
-                    waitedMs += 50;
-                }
-
-                if (hasValidAudio.load())
-                {
-                    playbackPosition.store(0);
-                    fractionalPosition = 0.0f;
-                    envState = EnvelopeState::Attack;
-                }
+                triggerInference(x, y, false);
+                // Inference is async - onInferenceFinished will start playback when ready
+                // NEVER sleep on the audio thread
             }
         }
 
@@ -638,7 +594,7 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
                     }
                     else
                     {
-                        triggerInference(currentX.load(), currentY.load());
+                        triggerInference(currentX.load(), currentY.load(), false);
                     }
                 }
                 else if (metadata.getMessage().isNoteOff())
@@ -650,82 +606,8 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
             }
         }
 
-        // Morph handling
-        float morphSpd = morphSpeed.load();
-        bool shouldMorph = (morphSpd > 0.0f && currentPos >= 0 && envState != EnvelopeState::Idle);
-
-        if (shouldMorph)
-        {
-            if (!wasMorphing)
-            {
-                morphAnchorX = currentX.load();
-                morphAnchorY = currentY.load();
-                morphPhase = 0.0f;
-                wasMorphing = true;
-                lastMorphX = morphAnchorX;
-                lastMorphY = morphAnchorY;
-                samplesUntilUpdate = 0.0f; // FIXED: Initialize properly
-            }
-
-            float phaseIncrement = morphSpd * 0.1f * buffer.getNumSamples() / (float)sampleRate;
-            morphPhase += phaseIncrement;
-
-            float minX = soundMap.getMinX();
-            float maxX = soundMap.getMaxX();
-            float minY = soundMap.getMinY();
-            float maxY = soundMap.getMaxY();
-
-            float radiusX = (maxX - minX) * 0.3f * morphDepthX.load();
-            float radiusY = (maxY - minY) * 0.3f * morphDepthY.load();
-
-            float offsetX = std::sin(morphPhase) * radiusX;
-            float offsetY = std::sin(morphPhase * 0.7f) * radiusY;
-
-            float newX = juce::jlimit(minX, maxX, morphAnchorX + offsetX);
-            float newY = juce::jlimit(minY, maxY, morphAnchorY + offsetY);
-
-            currentX.store(newX);
-            currentY.store(newY);
-
-            float samplesPerUpdate = (float)sampleRate / morphRateHz.load();
-
-            samplesUntilUpdate -= (float)buffer.getNumSamples();
-
-            // FIXED: Prevent negative accumulation
-            if (samplesUntilUpdate <= 0.0f)
-            {
-                // Reset with proper wraparound
-                while (samplesUntilUpdate <= 0.0f)
-                    samplesUntilUpdate += samplesPerUpdate;
-
-                float dx = newX - lastMorphX;
-                float dy = newY - lastMorphY;
-                float distSq = dx * dx + dy * dy;
-
-                float mapScale = (maxX - minX) * (maxY - minY);
-                float threshold = mapScale * 0.00001f;
-
-                if (distSq > threshold)
-                {
-                    lastMorphX = newX;
-                    lastMorphY = newY;
-                    triggerInference(newX, newY);
-                }
-            }
-        }
-        else
-        {
-            // FIXED: Properly reset morph state
-            if (wasMorphing)
-            {
-                wasMorphing = false;
-                samplesUntilUpdate = 0.0f;
-                morphPhase = 0.0f;
-            }
-        }
-
-        // BACKGROUND INFERENCE: inferenceRate controls timing when morphSpeed == 0
-        if (morphSpeed.load() == 0.0f && decoder.isModelLoaded() && soundMap.getLatentDim() > 0)
+        // BACKGROUND INFERENCE
+        if (decoder.isModelLoaded() && soundMap.getLatentDim() > 0)
         {
             float rate = inferenceRate.load();
 
@@ -734,7 +616,7 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
                 // Immediate background inference: trigger on position change
                 if (backgroundPositionChanged)
                 {
-                    triggerInference(currentX.load(), currentY.load());
+                    triggerInference(currentX.load(), currentY.load(), false);
                     backgroundPositionChanged = false;
                 }
             }
@@ -744,7 +626,7 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
                 paramUpdateCounter -= (float)buffer.getNumSamples();
                 if (paramUpdateCounter <= 0.0f && backgroundPositionChanged)
                 {
-                    triggerInference(currentX.load(), currentY.load());
+                    triggerInference(currentX.load(), currentY.load(), false);
                     paramUpdateCounter = (float)getSampleRate() / rate; // Reset counter
                     backgroundPositionChanged = false;
                 }
@@ -793,11 +675,19 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
     {
         if (triggerCrossfade.load())
         {
-            isCrossfading = true;
-            crossfadePosition = 0.0f;
-            float crossfadeSamples = (float)getSampleRate() * 0.05f;
-            if (crossfadeSamples < 1.0f) crossfadeSamples = 1.0f;
-            crossfadeIncrement = 1.0f / crossfadeSamples;
+            if (!isCrossfading)
+            {
+                // Only start a fresh crossfade if one isn't already in progress.
+                // If we're already crossfading the new content is already in the back
+                // buffer — just let the current fade finish rather than resetting to
+                // 0 every time a new inference arrives (which would cause the fade to
+                // never complete and the active buffer to never flip during rapid automation).
+                isCrossfading = true;
+                crossfadePosition = 0.0f;
+                float crossfadeSamples = (float)getSampleRate() * 0.05f;
+                if (crossfadeSamples < 1.0f) crossfadeSamples = 1.0f;
+                crossfadeIncrement = 1.0f / crossfadeSamples;
+            }
             triggerCrossfade.store(false);
         }
 
@@ -836,6 +726,7 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
         }
 
         int outputSamples = buffer.getNumSamples();
+        int samplesWritten = 0;
 
         for (int i = 0; i < outputSamples; ++i)
         {
@@ -977,10 +868,35 @@ void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer
 
             leftOut[i] += wetL * mixVal;
             rightOut[i] += wetR * mixVal;
+            samplesWritten = i + 1;
 
             fractionalPosition += speed;
 
             if (envState == EnvelopeState::Idle) break;
+        }
+
+        // Apply LP filter live (same code path for both realtime and offline export)
+        if (samplesWritten > 0)
+        {
+            float cutoff = juce::jlimit(20.0f, 20000.0f, lpCutoff.load());
+            float reso = lpReso.load();
+
+            if (cutoff != lastCutoff || reso != lastReso)
+            {
+                double Q = 0.707 + (double)reso * 10.0;
+                currentCoeffs = juce::IIRCoefficients::makeLowPass(currentSampleRate, (double)cutoff, Q);
+                lpFilter1.setCoefficients(currentCoeffs);
+                lpFilter2.setCoefficients(currentCoeffs);
+                lastCutoff = cutoff;
+                lastReso = reso;
+            }
+
+            // Two cascaded biquads for 4th-order LP on the mono content
+            lpFilter1.processSamples(leftOut, samplesWritten);
+            lpFilter2.processSamples(leftOut, samplesWritten);
+
+            // Mirror filtered mono to right channel (content is always mono)
+            juce::FloatVectorOperations::copy(rightOut, leftOut, samplesWritten);
         }
 
         if (envState != EnvelopeState::Idle)
@@ -1009,14 +925,6 @@ void LatentAudioVSTAudioProcessor::setLatch(bool shouldLatch)
     isLatch.store(shouldLatch);
 }
 
-void LatentAudioVSTAudioProcessor::setEnvelope(float attack, float decay, float sustain, float release)
-{
-    attackTime.store(attack);
-    decayTime.store(decay);
-    sustainLevel.store(sustain);
-    releaseTime.store(release);
-}
-
 void LatentAudioVSTAudioProcessor::setGain(float newGain)
 {
     outputGain.store(newGain);
@@ -1029,47 +937,14 @@ void LatentAudioVSTAudioProcessor::setMix(float wetAmount)
 
 void LatentAudioVSTAudioProcessor::setFilterCutoff(float cutoffHz)
 {
-    float oldCutoff = lpCutoff.load();
     lpCutoff.store(cutoffHz);
-
-    // Re-trigger inference if value changed significantly and we have valid audio
-    if (hasValidAudio.load() && std::abs(cutoffHz - oldCutoff) > 1.0f)
-    {
-        triggerInference(currentX.load(), currentY.load());
-    }
+    // Filter is applied live in processBlock - no inference needed
 }
 
 void LatentAudioVSTAudioProcessor::setFilterResonance(float reso)
 {
-    float newReso = juce::jlimit(0.0f, 1.0f, reso);
-    float oldReso = lpReso.load();
-    lpReso.store(newReso);
-
-    // Re-trigger inference if value changed significantly and we have valid audio
-    if (hasValidAudio.load() && std::abs(newReso - oldReso) > 0.01f)
-    {
-        triggerInference(currentX.load(), currentY.load());
-    }
-}
-
-void LatentAudioVSTAudioProcessor::setMorphSpeed(float speed)
-{
-    morphSpeed.store(speed);
-}
-
-void LatentAudioVSTAudioProcessor::setMorphDepthX(float depth)
-{
-    morphDepthX.store(juce::jlimit(0.0f, 1.0f, depth));
-}
-
-void LatentAudioVSTAudioProcessor::setMorphDepthY(float depth)
-{
-    morphDepthY.store(juce::jlimit(0.0f, 1.0f, depth));
-}
-
-void LatentAudioVSTAudioProcessor::setMorphRate(float hz)
-{
-    morphRateHz.store(juce::jlimit(0.1f, 20.0f, hz));
+    lpReso.store(juce::jlimit(0.0f, 1.0f, reso));
+    // Filter is applied live in processBlock - no inference needed
 }
 
 void LatentAudioVSTAudioProcessor::setTriggerOnMidi(bool shouldTrigger)
@@ -1106,17 +981,6 @@ void LatentAudioVSTAudioProcessor::setPositionX(float normalizedX)
         return;
     }
 
-    // Priority: morph takes precedence when active
-    if (morphSpeed.load() > 0.0f)
-    {
-        // Morph active: update position but don't trigger inference
-        currentX.store(actualX);
-        // Update tracking for when morph becomes inactive
-        lastParamX = actualX;
-        lastParamY = currentY.load();
-        return;
-    }
-
     // Check if position changed for background inference tracking
     if (std::abs(actualX - lastBackgroundX) > 0.001f ||
         std::abs(currentY.load() - lastBackgroundY) > 0.001f)
@@ -1126,8 +990,10 @@ void LatentAudioVSTAudioProcessor::setPositionX(float normalizedX)
         lastBackgroundY = currentY.load();
     }
 
-    // Morph inactive: trigger inference immediately
-    triggerInference(actualX, currentY.load());
+    // Morph inactive: trigger inference immediately.
+    // Pass false — we're responding to a parameter callback, not user cursor drag,
+    // so we must not echo back via setValueNotifyingHost.
+    triggerInference(actualX, currentY.load(), false);
 }
 
 void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
@@ -1149,17 +1015,6 @@ void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
         return;
     }
 
-    // Priority: morph takes precedence when active
-    if (morphSpeed.load() > 0.0f)
-    {
-        // Morph active: update position but don't trigger inference
-        currentY.store(actualY);
-        // Update tracking for when morph becomes inactive
-        lastParamX = currentX.load();
-        lastParamY = actualY;
-        return;
-    }
-
     // Check if position changed for background inference tracking
     if (std::abs(currentX.load() - lastBackgroundX) > 0.001f ||
         std::abs(actualY - lastBackgroundY) > 0.001f)
@@ -1169,8 +1024,8 @@ void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
         lastBackgroundY = actualY;
     }
 
-    // Morph inactive: trigger inference immediately
-    triggerInference(currentX.load(), actualY);
+    // Morph inactive: trigger inference immediately (no host sync — param callback).
+    triggerInference(currentX.load(), actualY, false);
 }
 
 void LatentAudioVSTAudioProcessor::triggerRandomPosition()
@@ -1190,7 +1045,7 @@ void LatentAudioVSTAudioProcessor::triggerRandomPosition()
 }
 
 //==============================================================================
-void LatentAudioVSTAudioProcessor::triggerInference(float x, float y)
+void LatentAudioVSTAudioProcessor::triggerInference(float x, float y, bool syncToHost)
 {
     // juce::Logger::writeToLog("[triggerInference] Called with x=" + juce::String(x) + ", y=" + juce::String(y));
     // juce::Logger::writeToLog("[triggerInference] soundMap.getLatentDim()=" + juce::String(soundMap.getLatentDim()));
@@ -1215,20 +1070,21 @@ void LatentAudioVSTAudioProcessor::triggerInference(float x, float y)
     float rangeX = maxX - minX;
     float rangeY = maxY - minY;
 
-    if (rangeX > 0.0001f && rangeY > 0.0001f)
+    // Only notify the host when triggered by direct user interaction (cursor drag,
+    // random button, etc.) for automation recording.  When called from a parameter
+    // callback (setPositionX/Y) or from processBlock, skip this: setValueNotifyingHost
+    // fires an async parameterChanged callback AFTER syncingPositionParams is already
+    // cleared, causing a stale-position re-trigger that fights the live automation.
+    if (syncToHost && rangeX > 0.0001f && rangeY > 0.0001f)
     {
         float normalizedX = juce::jlimit(0.0f, 1.0f, (x - minX) / rangeX);
         float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - y) / rangeY); // Y is inverted
 
-        // Set guard flag to prevent feedback loop
         syncingPositionParams.store(true);
-
-        // Update APVTS parameters - this notifies the host for automation recording
         if (auto* paramX = parameters->getParameter("positionX"))
             paramX->setValueNotifyingHost(normalizedX);
         if (auto* paramY = parameters->getParameter("positionY"))
             paramY->setValueNotifyingHost(normalizedY);
-
         syncingPositionParams.store(false);
     }
 
@@ -1334,26 +1190,25 @@ void LatentAudioVSTAudioProcessor::processOfflinePositionChange(float x, float y
         triggerCrossfade.store(true);
     }
 
-    // Only start playback if not already playing (match realtime behavior)
+    // In offline mode always do a hard swap - crossfading during export produces
+    // different output than realtime playback and causes the export mismatch.
+    {
+        int backIndex = 1 - activeBufferIndex.load();
+        activeBufferIndex.store(backIndex);
+        triggerCrossfade.store(false);
+        isCrossfading = false;
+    }
+
     if (playbackPosition.load() < 0)
     {
         playbackPosition.store(0);
         fractionalPosition = 0.0f;
-
-        // Swap to back buffer immediately for first playback
-        int backIndex = 1 - activeBufferIndex.load();
-        activeBufferIndex.store(backIndex);
-        triggerCrossfade.store(false);
-
-        hasValidAudio.store(true);
-
-        if (envState == EnvelopeState::Idle || envState == EnvelopeState::Release)
-            envState = EnvelopeState::Attack;
     }
-    else
-    {
-        hasValidAudio.store(true);
-    }
+
+    hasValidAudio.store(true);
+
+    if (envState == EnvelopeState::Idle || envState == EnvelopeState::Release)
+        envState = EnvelopeState::Attack;
 
     // Update tracking
     lastOfflineX = x;
@@ -1667,32 +1522,8 @@ void LatentAudioVSTAudioProcessor::applyPostProcessing(std::vector<float>& audio
 {
     if (audio.empty()) return;
 
-    // Use actual sample rate
-    double sampleRate = currentSampleRate;
-
-    float cutoff = juce::jlimit(20.0f, 20000.0f, lpCutoff.load());
-    float reso = lpReso.load();
-
-    // Thread-safe filter update
-    {
-        const juce::ScopedLock sl(filterLock);
-
-        // Always recalculate coefficients for new audio (filters were just reset)
-        double Q = 0.707 + reso * 10.0;
-        currentCoeffs = juce::IIRCoefficients::makeLowPass(sampleRate, (double)cutoff, Q);
-
-        lpFilter1.setCoefficients(currentCoeffs);
-        lpFilter2.setCoefficients(currentCoeffs);
-
-        lastCutoff = cutoff;
-        lastReso = reso;
-
-        // Apply filters
-        lpFilter1.processSamples(audio.data(), (int)audio.size());
-        lpFilter2.processSamples(audio.data(), (int)audio.size());
-    }
-
-    // Rest of post-processing (tail removal, normalization)
+    // LP filter is applied live in processBlock, not pre-baked here.
+    // This ensures realtime playback and offline export use identical filter state.
     const float threshold = std::pow(10.0f, -60.0f / 20.0f);
     int lastHotIndex = -1;
     int n = (int)audio.size();
@@ -1832,16 +1663,19 @@ bool LatentAudioVSTAudioProcessor::loadModelFolder(const juce::File& folder)
     folder.findChildFiles(modelFiles, juce::File::findFiles, false, "*.onnx");
     folder.findChildFiles(jsonFiles, juce::File::findFiles, false, "*.json");
 
-    // CRITICAL: Complete audio shutdown
+    // Signal that a switch is in progress.  Any onInferenceFinished callback
+    // that fires while this flag is true will discard its result immediately,
+    // so we don't need a sleep() to wait for the inference thread to drain.
+    modelSwitchPending.store(true);
+
+    // Stop playback and mark audio invalid *before* touching anything else.
+    hasValidAudio.store(false);
     playbackPosition.store(-1);
     envState = EnvelopeState::Idle;
     currentEnvLevel = 0.0f;
     fractionalPosition = 0.0f;
     isCrossfading = false;
     triggerCrossfade.store(false);
-    hasValidAudio.store(false);  // Mark audio as invalid
-
-    juce::Thread::sleep(100);  // Let audio thread finish
 
     bool success = false;
 
@@ -1892,6 +1726,18 @@ bool LatentAudioVSTAudioProcessor::loadModelFolder(const juce::File& folder)
             activeBufferIndex.store(0);
         }
 
+        // Re-assert the full playback reset AFTER clearing buffers.
+        // This wins any race where onInferenceFinished managed to write
+        // hasValidAudio=true / playbackPosition=0 before the buffer clear
+        // (i.e. it beat the modelSwitchPending guard on a very tight race).
+        hasValidAudio.store(false);
+        playbackPosition.store(-1);
+        envState = EnvelopeState::Idle;
+        currentEnvLevel = 0.0f;
+        fractionalPosition = 0.0f;
+        isCrossfading = false;
+        triggerCrossfade.store(false);
+
         // Reset filters
         {
             const juce::ScopedLock sl(filterLock);
@@ -1904,7 +1750,17 @@ bool LatentAudioVSTAudioProcessor::loadModelFolder(const juce::File& folder)
         lastGeneratedWaveform.clear();
         newWaveformAvailable.store(false);
 
+        // Allow onInferenceFinished to process results from the new model again,
+        // and trigger auto-generation on the next processBlock.
+        modelSwitchPending.store(false);
+        isFirstProcess.store(true);
+
         juce::Logger::writeToLog("[loadModelFolder] Complete reset performed");
+    }
+    else
+    {
+        // Load failed — clear the flag so inference still works if the old model is intact.
+        modelSwitchPending.store(false);
     }
 
     juce::Logger::writeToLog("[loadModelFolder] === END: " + juce::String(success ? "SUCCESS" : "FAILED") + " ===");

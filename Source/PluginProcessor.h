@@ -76,7 +76,10 @@ public:
     void parameterChanged(const juce::String& parameterID, float newValue) override;
 
     // Trigger inference from UI
-    void triggerInference(float x, float y);
+    // syncToHost = true: notify DAW (automation recording from cursor drag / random)
+    // syncToHost = false: called from parameter callback or processBlock — skip the
+    //                     setValueNotifyingHost echo that would re-trigger inference
+    void triggerInference(float x, float y, bool syncToHost = true);
     void triggerRandomPosition(); // NEW
     void releaseNote();
 
@@ -85,15 +88,10 @@ public:
     void setFineTune(float multiplier); // NEW
     void setCrossfade(float amount);
     void setLatch(bool shouldLatch);
-    void setEnvelope(float attack, float decay, float sustain, float release); // Updated
     void setGain(float newGain);
     void setMix(float wetAmount); // NEW
     void setFilterCutoff(float cutoffHz);
     void setFilterResonance(float reso); // NEW
-    void setMorphSpeed(float speed); // NEW
-    void setMorphDepthX(float depth); // NEW
-    void setMorphDepthY(float depth); // NEW
-    void setMorphRate(float hz); // NEW
     void setTriggerOnMidi(bool shouldTrigger);
     void setPositionX(float normalizedX);
     void setPositionY(float normalizedY);
@@ -118,16 +116,7 @@ public:
     std::atomic<float> currentY{ 0.0f }; // NEW: Track active cursor position
     std::atomic<bool> midiActive{ false }; // NEW: Track MIDI activity
     int midiActivityCounter{ 0 }; // NEW: Counter to clear MIDI activity after timeout
-    std::atomic<float> morphSpeed{ 0.0f }; // Moved to public for Editor access
-    std::atomic<float> morphDepthX{ 1.0f }; // NEW: 0.0 to 1.0
-    std::atomic<float> morphDepthY{ 1.0f }; // NEW: 0.0 to 1.0
-    std::atomic<float> morphRateHz{ 2.0f }; // NEW: Updates per second
 
-    // Envelope params (Full ADSR) - Moved to public for Editor visualization
-    std::atomic<float> attackTime{ 0.01f };
-    std::atomic<float> decayTime{ 0.1f };
-    std::atomic<float> sustainLevel{ 0.7f };
-    std::atomic<float> releaseTime{ 0.5f };
     std::atomic<bool> isLatch{ false }; // Moved to public for Editor access
     std::atomic<float> sampleLength{ 1.0f }; // Moved to public for Editor access
     std::atomic<float> sampleStart{ 0.0f }; // Moved to public for Editor access
@@ -157,15 +146,6 @@ private:
     // NEW parameters
     std::atomic<float> mixAmount{ 1.0f }; // 0=dry, 1=wet
 
-    // Morph automation
-    float morphPhase = 0.0f;
-    float lastMorphX = 0.0f;
-    float lastMorphY = 0.0f;
-    float morphAnchorX = 0.0f;
-    float morphAnchorY = 0.0f;
-    bool wasMorphing = false;
-    float samplesUntilUpdate = 0.0f; // NEW: Counter for update rate
-
     // Parameter automation throttling
     float lastParamX = 0.0f;
     float lastParamY = 0.0f;
@@ -180,7 +160,12 @@ private:
     // Guard flag to prevent feedback loop when syncing position parameters
     std::atomic<bool> syncingPositionParams{ false };
 
-    // Envelope params
+    // Envelope params (hardcoded quick-gate — no user controls)
+    std::atomic<float> attackTime{ 0.001f };
+    std::atomic<float> decayTime{ 0.001f };
+    std::atomic<float> sustainLevel{ 1.0f };
+    std::atomic<float> releaseTime{ 0.02f };
+
     std::atomic<bool> triggerOnMidi{ false };
     std::atomic<float> outputGain{ 1.0f };
 
@@ -213,6 +198,10 @@ juce::CriticalSection filterLock;        // NEW: Protect filter state
 
 // Offline mode (export) support - run synchronous inference
 std::atomic<bool> isOfflineMode{false};
+
+// Set to true for the duration of a model switch so onInferenceFinished
+// discards any stale in-flight result from the old model.
+std::atomic<bool> modelSwitchPending{false};
 std::vector<float> offlineLatentBuffer;
 std::vector<float> offlineAudioBuffer;
 float lastOfflineX = -999.0f;
