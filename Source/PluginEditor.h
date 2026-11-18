@@ -24,205 +24,96 @@
 #include "LatentLookAndFeel.h"
 
 //==============================================================================
-class LatentAudioVSTAudioProcessorEditor : public juce::AudioProcessorEditor,
-    private juce::Timer,
-    private juce::Button::Listener
+// Plots the 4-pole low-pass response (in dB) for the current cutoff/resonance.
+class FilterGraph : public juce::Component
 {
 public:
-    LatentAudioVSTAudioProcessorEditor(LatentAudioVSTAudioProcessor&);
-    ~LatentAudioVSTAudioProcessorEditor() override;
+    FilterGraph (std::atomic<float>& cutoff, std::atomic<float>& resonance) : cutoffParam (cutoff), resoParam (resonance) {}
 
-    void paint(juce::Graphics&) override;
-    void resized() override;
-
-public:
-    void updateUIFromProcessor();
-
-public:
-    NebulaComponent nebulaComp;
+    bool needsUpdate() const { return cutoffParam.load() != lastCutoff || resoParam.load() != lastReso; }
+    void paint (juce::Graphics&) override;
 
 private:
-    LatentAudioVSTAudioProcessor& audioProcessor;
+    std::atomic<float>& cutoffParam;
+    std::atomic<float>& resoParam;
+    float lastCutoff = -1.0f, lastReso = -1.0f;
+};
 
-    // Main Components
-    WaveformComponent waveformComp;
+//==============================================================================
+class MidiLed : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    void setLit (bool shouldBeLit) { if (lit != shouldBeLit) { lit = shouldBeLit; repaint(); } }
+    void paint (juce::Graphics&) override;
 
-    // PLAYBACK Section
-    juce::Slider rateSlider;
-    juce::Label rateLabel;
+private:
+    bool lit = false;
+};
 
-    juce::Slider tuneSlider;
-    juce::Label tuneLabel;
+//==============================================================================
+class LatentAudioVSTAudioProcessorEditor : public juce::AudioProcessorEditor,
+                                           public juce::FileDragAndDropTarget,
+                                           private juce::Timer
+{
+public:
+    explicit LatentAudioVSTAudioProcessorEditor (LatentAudioVSTAudioProcessor&);
+    ~LatentAudioVSTAudioProcessorEditor() override;
 
-    juce::Slider crossfadeSlider;
-    juce::Label crossfadeLabel;
+    void paint (juce::Graphics&) override;
+    void paintOverChildren (juce::Graphics&) override;
+    void resized() override;
 
-    // FILTER Section
-    juce::Slider cutoffSlider;
-    juce::Label cutoffLabel;
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragEnter (const juce::StringArray&, int, int) override { setDragHover (true); }
+    void fileDragExit (const juce::StringArray&) override { setDragHover (false); }
+    void filesDropped (const juce::StringArray& files, int, int) override;
 
-    juce::Slider resoSlider;
-    juce::Label resoLabel;
+    // Exposed for tests
+    NebulaComponent& getNebula() { return nebula; }
 
+private:
+    struct Knob
+    {
+        juce::Slider slider { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
+        juce::Label label;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
+        int section = 0;
+    };
 
-    // MASTER Section
-    juce::Slider gainSlider;
-    juce::Label gainLabel;
+    Knob& addKnob (const juce::String& paramId, const juce::String& name, const juce::String& tooltip, int section);
+    void addToggle (juce::ToggleButton& button, const juce::String& paramId, const juce::String& text, const juce::String& tooltip);
+    void chooseModelFolder();
+    void setDragHover (bool hover) { if (dragHover != hover) { dragHover = hover; repaint(); } }
+    void timerCallback() override;
 
-    juce::Slider mixSlider;
-    juce::Label mixLabel;
+    LatentAudioVSTAudioProcessor& processor;
+    LatentLookAndFeel laf;
+    juce::TooltipWindow tooltipWindow { this, 600 };
 
-    juce::Slider lengthSlider;
-    juce::Label lengthLabel;
+    NebulaComponent nebula;
+    WaveformComponent waveform;
+    FilterGraph filterGraph;
+    MidiLed midiLed;
 
-    juce::Slider startSlider;
-    juce::Label startLabel;
+    juce::Label titleLabel, modelLabel, statusLabel, providerLabel, coordLabel;
+    juce::TextButton loadButton { "Load Model..." }, unloadButton { "Unload" };
+    juce::TextButton randomButton { "Random" }, centerButton { "Center" }, resetButton { "Reset" };
+    juce::ToggleButton playOnNoteToggle, holdToggle, snapToggle, keyTrackToggle;
 
-    // Toggles
-    juce::ToggleButton holdToggle;
-    juce::ToggleButton snapToggle;
-    juce::ToggleButton triggerToggle;
-    juce::TextButton randomButton;
-    juce::TextButton resetButton;
-    juce::TextButton homeButton;
+    std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
+    std::vector<std::unique_ptr<Knob>> knobs;
+    Knob* rootKnob = nullptr;
 
-
-
-    // Toggle Labels
-    juce::Label holdLabel;
-    juce::Label snapLabel;
-    juce::Label triggerLabel;
-
-    // Parameter Attachments
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> tuneAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> resoAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> mixAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> startAttachment;
-
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> latchAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> triggerAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> snapAttachment;
-
-    // Model loading
-    juce::TextButton loadModelFolderButton;
-    juce::TextButton unloadModelButton;
-    juce::Label modelFolderPathLabel;
-    juce::Label modelStatusLabel;
-    juce::Label soundMapStatusLabel;
-
-    // Coordinate display
-    juce::Label xCoordLabel;
-    juce::Label yCoordLabel;
-    juce::Label providerLabel; // shows "CPU" / "GPU: CUDA" / "GPU: DML"
     std::unique_ptr<juce::FileChooser> fileChooser;
 
-    void timerCallback() override;
-    void resetAllKnobs();
-    void buttonClicked(juce::Button* button) override;
+    // UI state polled from the processor (per editor instance)
+    std::shared_ptr<const SoundMapData> shownMap;
+    uint32_t lastDisplayVersion = 0xffffffffu;
+    uint32_t lastMidiCount = 0;
+    juce::uint32 midiLitUntil = 0;
+    bool dragHover = false;
+    std::array<juce::Rectangle<int>, 3> sectionAreas;
+    juce::Rectangle<int> headerArea;
 
-    // Filter Visualization
-    class FilterGraph : public juce::Component
-    {
-    public:
-        FilterGraph(LatentAudioVSTAudioProcessor& p) : processor(p) {}
-        void paint(juce::Graphics& g) override
-        {
-            auto w = (float)getWidth();
-            auto h = (float)getHeight();
-            if (w <= 0.0f || h <= 0.0f) return;
-
-            auto bounds = getLocalBounds().toFloat();
-
-            // Background
-            g.setColour(juce::Colour(0xff0d0d1a));
-            g.fillRoundedRectangle(bounds, 4.0f);
-
-            // Grid lines
-            g.setColour(juce::Colour(0xff1a1a30));
-            for (float fx = w * 0.25f; fx < w; fx += w * 0.25f)
-                g.drawLine(fx, 0.0f, fx, h, 0.5f);
-            g.drawLine(0.0f, h * 0.5f, w, h * 0.5f, 0.5f);
-
-            float cutoff = processor.lpCutoff.load();
-            float reso   = processor.lpReso.load();
-
-            juce::Path freqPath;
-            for (int i = 0; i < (int)w; i += 2)
-            {
-                float x     = (float)i;
-                float freq  = 20.0f * std::pow(1000.0f, x / w);
-                float ratio = freq / cutoff;
-                float mag   = 1.0f / std::sqrt(1.0f + std::pow(ratio, 4.0f) - reso * 0.5f);
-                float y     = h - (mag * h * 0.9f);
-                if (i == 0) freqPath.startNewSubPath(x, y);
-                else        freqPath.lineTo(x, y);
-            }
-
-            // Gradient fill under curve
-            juce::Path fillPath = freqPath;
-            fillPath.lineTo(w, h); fillPath.lineTo(0.0f, h); fillPath.closeSubPath();
-            juce::ColourGradient fillGrad(juce::Colour(0x3038bdf8), 0.0f, 0.0f,
-                                           juce::Colours::transparentBlack, 0.0f, h, false);
-            g.setGradientFill(fillGrad);
-            g.fillPath(fillPath);
-
-            // Stroke
-            g.setColour(juce::Colour(0xff38bdf8).withAlpha(0.9f));
-            g.strokePath(freqPath, juce::PathStrokeType(1.5f));
-
-            // Border
-            g.setColour(juce::Colour(0xff2a2a4a));
-            g.drawRoundedRectangle(bounds.reduced(0.5f), 4.0f, 1.0f);
-        }
-    private:
-        LatentAudioVSTAudioProcessor& processor;
-    };
-
-    // MIDI Activity Indicator
-    class MidiActivityIndicator : public juce::Component
-    {
-    public:
-        MidiActivityIndicator(LatentAudioVSTAudioProcessor& p) : processor(p) {}
-
-        void paint(juce::Graphics& g) override
-        {
-            auto bounds = getLocalBounds().toFloat().reduced(2.0f);
-
-            // Dark base circle
-            g.setColour(juce::Colour(0xff141428));
-            g.fillEllipse(bounds);
-            g.setColour(juce::Colour(0xff2a2a4a));
-            g.drawEllipse(bounds, 1.0f);
-
-            if (processor.isMidiActive())
-            {
-                // Outer glow
-                juce::ColourGradient glow(juce::Colour(0x604ade80),
-                                          bounds.getCentreX(), bounds.getCentreY(),
-                                          juce::Colours::transparentBlack,
-                                          bounds.getRight(), bounds.getCentreY(), true);
-                g.setGradientFill(glow);
-                g.fillEllipse(bounds.expanded(3.0f));
-
-                // Core
-                g.setColour(juce::Colour(0xff4ade80));
-                g.fillEllipse(bounds.reduced(2.0f));
-            }
-        }
-
-    private:
-        LatentAudioVSTAudioProcessor& processor;
-    };
-
-    FilterGraph filterGraph;
-    MidiActivityIndicator midiIndicator;
-
-    LatentLookAndFeel laf;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LatentAudioVSTAudioProcessorEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LatentAudioVSTAudioProcessorEditor)
 };

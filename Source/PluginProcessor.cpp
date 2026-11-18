@@ -17,1815 +17,1059 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "LatentLog.h"
+
+namespace
+{
+    constexpr double kAttackSeconds     = 0.001;  // fixed declick gate
+    constexpr double kReleaseSeconds    = 0.02;
+    constexpr double kSwapFadeSeconds   = 0.05;   // crossfade when new audio replaces old
+    constexpr double kStealFadeSeconds  = 0.004;  // retrigger declick
+    constexpr int    kStateVersion      = 2;
+
+    // 4-point, 3rd-order Hermite interpolation with edge clamping.
+    inline float readHermite (const float* data, int len, double pos) noexcept
+    {
+        const int i = (int) pos;
+        const float t = (float) (pos - (double) i);
+        auto at = [data, len] (int k) noexcept { return data[juce::jlimit (0, len - 1, k)]; };
+        const float xm1 = at (i - 1), x0 = at (i), x1 = at (i + 1), x2 = at (i + 2);
+        const float c1 = 0.5f * (x1 - xm1);
+        const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+        const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+        return ((c3 * t + c2) * t + c1) * t + x0;
+    }
+
+    juce::AudioParameterFloatAttributes floatAttr (std::function<juce::String (float)> toText)
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [toText] (float v, int) { return toText (v); });
+    }
+
+    juce::String formatHz (float hz)
+    {
+        return hz >= 1000.0f ? juce::String (hz / 1000.0f, 2) + " kHz" : juce::String ((int) hz) + " Hz";
+    }
+
+    juce::String formatDb (float linear)
+    {
+        return linear <= 0.0001f ? juce::String ("-inf dB")
+                                 : juce::String (juce::Decibels::gainToDecibels (linear), 1) + " dB";
+    }
+
+    juce::String formatPercent (float v) { return juce::String (juce::roundToInt (v * 100.0f)) + "%"; }
+}
 
 //==============================================================================
 LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
-#ifndef JucePlugin_PreferredChannelConfigurations
-    : AudioProcessor(BusesProperties()
-#if ! JucePlugin_IsMidiEffect
-#if ! JucePlugin_IsSynth
-        .withInput("Input", juce::AudioChannelSet::stereo(), true)
-#endif
-        .withOutput("Output", juce::AudioChannelSet::stereo(), true)
-#endif
-    ),
-    inferenceThread(decoder)
-#endif
+    : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      inferenceThread ([this] { serviceInference(); })
 {
-    // Set up file-based logging for DAW debugging
-    juce::File logFile = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                            .getChildFile("LatentAudioVST_debug.log");
-    juce::Logger::setCurrentLogger(new juce::FileLogger(logFile, "LatentAudioVST Debug Log"));
+    using PID = juce::ParameterID;
+    using Range = juce::NormalisableRange<float>;
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
 
-    juce::Logger::writeToLog("[PluginProcessor] === CONSTRUCTOR ===");
-    juce::Logger::writeToLog("[PluginProcessor] this=" + juce::String::toHexString((juce::int64)this));
-    juce::Logger::writeToLog("[PluginProcessor] LatentDecoder instance count: " + juce::String(LatentDecoder::getInstanceCount()));
+    // IDs and ranges of version-1 parameters are unchanged so existing DAW
+    // projects and automation keep working.
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "playbackRate", 1 }, "Playback Rate", Range (0.1f, 2.0f), 1.0f,
+        floatAttr ([] (float v) { return juce::String (v, 2) + "x"; })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "fineTune", 1 }, "Fine Tune (cents)", Range (-100.0f, 100.0f), 0.0f,
+        floatAttr ([] (float v) { return juce::String (juce::roundToInt (v)) + " ct"; })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "crossfade", 1 }, "Loop Crossfade", Range (0.0f, 0.5f), 0.05f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "filterCutoff", 1 }, "Filter Cutoff (Hz)", Range (20.0f, 20000.0f, 1.0f, 0.3f), 10000.0f,
+        floatAttr (formatHz)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "filterResonance", 1 }, "Filter Resonance", Range (0.0f, 1.0f), 0.0f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "outputGain", 1 }, "Output Gain", Range (0.0f, 2.0f), 1.0f,
+        floatAttr (formatDb)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "mixAmount", 1 }, "Level", Range (0.0f, 1.0f), 1.0f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "sampleLength", 1 }, "Sample End", Range (0.1f, 1.0f), 1.0f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "sampleStart", 1 }, "Sample Start", Range (0.0f, 0.9f), 0.0f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "positionX", 1 }, "Position X", Range (0.0f, 1.0f), 0.5f,
+        floatAttr ([] (float v) { return juce::String (v, 3); })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "positionY", 1 }, "Position Y", Range (0.0f, 1.0f), 0.5f,
+        floatAttr ([] (float v) { return juce::String (v, 3); })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "inferenceRate", 1 }, "Inference Rate (Hz)", Range (0.0f, 50.0f), 10.0f,
+        floatAttr ([] (float v) { return v <= 0.0f ? juce::String ("Unlimited") : juce::String (v, 1) + " Hz"; })));
+    p.push_back (std::make_unique<juce::AudioParameterBool> (PID { "latchMode", 1 }, "Hold (Loop)", false));
+    p.push_back (std::make_unique<juce::AudioParameterBool> (PID { "triggerOnMidi", 1 }, "Play on Note", false));
+    p.push_back (std::make_unique<juce::AudioParameterBool> (PID { "snapMode", 1 }, "Snap to Points", false));
 
-    inferenceThread.onInferenceFinished = [this](const std::vector<float>& rawAudio)
-        {
-            // Skip async results in offline/export mode - sync decode handles it there
-            if (isOfflineMode.load())
-                return;
+    // Version 2
+    p.push_back (std::make_unique<juce::AudioParameterBool> (PID { "keyTrack", 2 }, "Key Track", false));
+    p.push_back (std::make_unique<juce::AudioParameterInt> (PID { "rootNote", 2 }, "Root Note", 0, 127, 60,
+        juce::AudioParameterIntAttributes().withStringFromValueFunction (
+            [] (int n, int) { return juce::MidiMessage::getMidiNoteName (n, true, true, 4); })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "velocitySens", 2 }, "Velocity Sensitivity", Range (0.0f, 1.0f), 0.0f,
+        floatAttr (formatPercent)));
 
-            // Discard any inference that was in-flight during a model switch.
-            // loadModelFolder sets this flag true before clearing state, and clears
-            // it only after everything (buffers, session, soundmap) is settled.
-            if (modelSwitchPending.load())
-                return;
+    parameters = std::make_unique<juce::AudioProcessorValueTreeState> (
+        *this, nullptr, "PARAMETERS", juce::AudioProcessorValueTreeState::ParameterLayout (p.begin(), p.end()));
 
-            // juce::Logger::writeToLog("[InferenceFinished] Received " + juce::String(rawAudio.size()) + " samples");
+    auto raw = [this] (const char* id) { return parameters->getRawParameterValue (id); };
+    pRate = raw ("playbackRate");     pTune = raw ("fineTune");       pLoopXfade = raw ("crossfade");
+    pCutoff = raw ("filterCutoff");   pReso = raw ("filterResonance"); pGain = raw ("outputGain");
+    pMix = raw ("mixAmount");         pEnd = raw ("sampleLength");    pStart = raw ("sampleStart");
+    pPosX = raw ("positionX");        pPosY = raw ("positionY");      pInferenceRate = raw ("inferenceRate");
+    pLatch = raw ("latchMode");       pTriggerOnMidi = raw ("triggerOnMidi");
+    pKeyTrack = raw ("keyTrack");     pRootNote = raw ("rootNote");   pVelocity = raw ("velocitySens");
 
-            if (rawAudio.empty())
-            {
-                // juce::Logger::writeToLog("[InferenceFinished] EMPTY AUDIO - aborting");
-                return;
-            }
+    parameters->addParameterListener ("positionX", this);
+    parameters->addParameterListener ("positionY", this);
 
-            // Validate audio data BEFORE processing
-            bool hasInvalidData = false;
-            float maxAmp = 0.0f;
-            for (float sample : rawAudio)
-            {
-                if (!std::isfinite(sample))
-                {
-                    hasInvalidData = true;
-                    break;
-                }
-                maxAmp = std::max(maxAmp, std::abs(sample));
-            }
-
-            if (hasInvalidData)
-            {
-                // juce::Logger::writeToLog("[InferenceFinished] INVALID DATA (NaN/Inf) - aborting");
-                return;
-            }
-
-            if (maxAmp < 0.0001f)
-            {
-                // juce::Logger::writeToLog("[InferenceFinished] WARNING: Audio is silent (max=" + juce::String(maxAmp) + ")");
-            }
-
-            // juce::Logger::writeToLog("[InferenceFinished] Valid audio, max amplitude: " + juce::String(maxAmp));
-
-            // FILTER RESET REMOVED TO PREVENT CLICKS/CRACKLES
-            /*
-            {
-                const juce::ScopedLock sl(filterLock);
-                lpFilter1.reset();
-                lpFilter2.reset();
-                // juce::Logger::writeToLog("[InferenceFinished] Filters reset for new audio");
-            }
-            */
-
-            // Now apply post-processing
-            std::vector<float> processedAudio = rawAudio;
-            applyPostProcessing(processedAudio);
-
-            // Check post-processing didn't break it
-            maxAmp = 0.0f;
-            for (float sample : processedAudio)
-            {
-                if (!std::isfinite(sample))
-                {
-                    // juce::Logger::writeToLog("[InferenceFinished] POST-PROCESSING CREATED INVALID DATA - aborting");
-                    return;
-                }
-                maxAmp = std::max(maxAmp, std::abs(sample));
-            }
-
-            // juce::Logger::writeToLog("[InferenceFinished] Post-processed, max amplitude: " + juce::String(maxAmp));
-
-            // Copy to back buffer
-            {
-                juce::ScopedLock sl(bufferLock);
-
-                int backIndex = 1 - activeBufferIndex.load();
-                auto& backBuffer = soundBuffers[backIndex];
-
-                if (backBuffer.getNumSamples() != (int)processedAudio.size())
-                    backBuffer.setSize(2, (int)processedAudio.size(), false, false, false);
-
-                backBuffer.clear();
-
-                for (int ch = 0; ch < backBuffer.getNumChannels(); ++ch)
-                    juce::FloatVectorOperations::copy(backBuffer.getWritePointer(ch),
-                        processedAudio.data(),
-                        (int)processedAudio.size());
-
-                triggerCrossfade.store(true);
-
-                // juce::Logger::writeToLog("[InferenceFinished] Copied to buffer " + juce::String(backIndex));
-            }
-
-            // Start playback fresh if:
-            //   (a) not playing at all (playbackPosition < 0), OR
-            //   (b) playbackPosition was bumped to 0 by triggerInference but
-            //       hasValidAudio is still false (e.g. after a model switch reset).
-            //       In that case the active buffer is empty; a crossfade would
-            //       immediately hit totalGenerated==0 and return silently.
-            if (playbackPosition.load() < 0 || !hasValidAudio.load())
-            {
-                playbackPosition.store(0);
-                fractionalPosition = 0.0f;
-
-                int backIndex = 1 - activeBufferIndex.load();
-                activeBufferIndex.store(backIndex);
-                triggerCrossfade.store(false);
-                isCrossfading = false;
-
-                hasValidAudio.store(true);  // Mark that we have audio
-            }
-
-            // Update waveform display
-            lastGeneratedWaveform.resize(processedAudio.size());
-            std::memcpy(lastGeneratedWaveform.data(), processedAudio.data(), processedAudio.size() * sizeof(float));
-            newWaveformAvailable.store(true);
-
-            // juce::Logger::writeToLog("[InferenceFinished] === COMPLETE ===");
-        };
+    {
+        const juce::ScopedLock sl (statusLock);
+        status.message = "No model loaded";
+    }
 
     inferenceThread.startThread();
-
-    // FIXED: Create parameters vector first, then pass to ParameterLayout
-    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
-
-    // Playback
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "playbackRate", "Playback Rate",
-        juce::NormalisableRange<float>(0.1f, 2.0f), 1.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "fineTune", "Fine Tune (cents)",
-        juce::NormalisableRange<float>(-100.0f, 100.0f), 0.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "crossfade", "Crossfade Amount",
-        juce::NormalisableRange<float>(0.0f, 0.5f), 0.05f));
-
-    // Filter
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "filterCutoff", "Filter Cutoff (Hz)",
-        juce::NormalisableRange<float>(20.0f, 20000.0f, 1.0f, 0.3f), 10000.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "filterResonance", "Filter Resonance",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 0.0f));
-
-    // Master
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "outputGain", "Output Gain",
-        juce::NormalisableRange<float>(0.0f, 2.0f), 1.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "mixAmount", "Dry/Wet Mix",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "sampleLength", "Sample Length",
-        juce::NormalisableRange<float>(0.1f, 1.0f), 1.0f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "sampleStart", "Sample Start Position",
-        juce::NormalisableRange<float>(0.0f, 0.9f), 0.0f));
-
-    // Position automation parameters
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "positionX", "Position X",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 0.5f));
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "positionY", "Position Y",
-        juce::NormalisableRange<float>(0.0f, 1.0f), 0.5f));
-
-
-    // RateLimit (inferenceRate)
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        "inferenceRate", "Inference Rate (Hz)",
-        juce::NormalisableRange<float>(0.0f, 50.0f), 10.0f));
-
-    // Toggles - use AudioParameterBool instead
-    params.push_back(std::make_unique<juce::AudioParameterBool>(
-        "latchMode", "Latch Mode", false));
-
-    params.push_back(std::make_unique<juce::AudioParameterBool>(
-        "triggerOnMidi", "Trigger on MIDI", false));
-
-    params.push_back(std::make_unique<juce::AudioParameterBool>(
-        "snapMode", "Snap Mode", false));
-
-    // NOW create the APVTS with the vector
-    parameters = std::make_unique<juce::AudioProcessorValueTreeState>(
-        *this, nullptr, "PARAMETERS",
-        juce::AudioProcessorValueTreeState::ParameterLayout(params.begin(), params.end()));
-
-    // Add parameter listeners
-    parameters->addParameterListener("playbackRate", this);
-    parameters->addParameterListener("fineTune", this);
-    parameters->addParameterListener("crossfade", this);
-    parameters->addParameterListener("filterCutoff", this);
-    parameters->addParameterListener("filterResonance", this);
-    parameters->addParameterListener("outputGain", this);
-    parameters->addParameterListener("mixAmount", this);
-    parameters->addParameterListener("sampleLength", this);
-    parameters->addParameterListener("sampleStart", this);
-    parameters->addParameterListener("positionX", this);
-    parameters->addParameterListener("positionY", this);
-    parameters->addParameterListener("inferenceRate", this);
-    parameters->addParameterListener("latchMode", this);
-    parameters->addParameterListener("triggerOnMidi", this);
-    parameters->addParameterListener("snapMode", this);
-
 }
 
 LatentAudioVSTAudioProcessor::~LatentAudioVSTAudioProcessor()
 {
-    juce::Logger::writeToLog("[PluginProcessor] === DESTRUCTOR ===");
-    juce::Logger::writeToLog("[PluginProcessor] this=" + juce::String::toHexString((juce::int64)this));
-    juce::Logger::writeToLog("[PluginProcessor] LatentDecoder instance count before: " + juce::String(LatentDecoder::getInstanceCount()));
-    juce::Logger::writeToLog("[PluginProcessor] Stopping inference thread...");
-    inferenceThread.stopThread(4000);
-    juce::Logger::writeToLog("[PluginProcessor] Inference thread stopped");
-    juce::Logger::writeToLog("[PluginProcessor] === DESTRUCTOR END ===");
-    juce::Logger::setCurrentLogger(nullptr);
+    parameters->removeParameterListener ("positionX", this);
+    parameters->removeParameterListener ("positionY", this);
+    inferenceThread.stopThread (4000);
+    // Loading a model can't be interrupted; wait so the job never outlives us.
+    loaderPool.removeAllJobs (true, 60000);
 }
 
 //==============================================================================
-// ============================================================================
-// FIXED: parameterChanged for bool parameters
-// ============================================================================
-
-void LatentAudioVSTAudioProcessor::parameterChanged(const juce::String& parameterID, float newValue)
+juce::AudioProcessorEditor* LatentAudioVSTAudioProcessor::createEditor()
 {
-    if (parameterID == "playbackRate")
-        setPlaybackSpeed(newValue);
-    else if (parameterID == "fineTune")
-    {
-        // Convert cents to pitch multiplier
-        float semitones = newValue / 100.0f;
-        float multiplier = std::pow(2.0f, semitones / 12.0f);
-        setFineTune(multiplier);
-    }
-    else if (parameterID == "crossfade")
-        setCrossfade(newValue);
-    else if (parameterID == "filterCutoff")
-        setFilterCutoff(newValue);
-    else if (parameterID == "filterResonance")
-        setFilterResonance(newValue);
-    else if (parameterID == "outputGain")
-        setGain(newValue); // Already linear, no need for dB conversion
-    else if (parameterID == "mixAmount")
-        setMix(newValue);
-    else if (parameterID == "sampleLength")
-        setSampleLength(newValue);
-    else if (parameterID == "sampleStart")
-        setSampleStart(newValue);
-    else if (parameterID == "positionX")
-        setPositionX(newValue);
-    else if (parameterID == "positionY")
-        setPositionY(newValue);
+    return new LatentAudioVSTAudioProcessorEditor (*this);
+}
 
-    else if (parameterID == "latchMode")
-        setLatch(newValue > 0.5f); // Bool parameter
-    else if (parameterID == "inferenceRate")
-        ; // Handled in position setter methods
-    else if (parameterID == "triggerOnMidi")
-        setTriggerOnMidi(newValue > 0.5f); // Bool parameter
-    else if (parameterID == "snapMode")
-        ; // Handled in editor
+bool LatentAudioVSTAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    const auto out = layouts.getMainOutputChannelSet();
+    return (out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo())
+        && layouts.getMainInputChannelSet().isDisabled();
 }
 
 //==============================================================================
-const juce::String LatentAudioVSTAudioProcessor::getName() const
+juce::Point<float> LatentAudioVSTAudioProcessor::mapToNormalized (const SoundMapData& map, float x, float y)
 {
-    return JucePlugin_Name;
+    return { juce::jlimit (0.0f, 1.0f, (x - map.minX) / map.rangeX()),
+             juce::jlimit (0.0f, 1.0f, (map.maxY - y) / map.rangeY()) };
 }
 
-bool LatentAudioVSTAudioProcessor::acceptsMidi() const
+juce::Point<float> LatentAudioVSTAudioProcessor::normalizedToMap (const SoundMapData& map, float nx, float ny)
 {
-#if JucePlugin_WantsMidiInput
-    return true;
-#else
-    return false;
-#endif
-}
-
-bool LatentAudioVSTAudioProcessor::producesMidi() const
-{
-#if JucePlugin_ProducesMidiOutput
-    return true;
-#else
-    return false;
-#endif
-}
-
-bool LatentAudioVSTAudioProcessor::isMidiEffect() const
-{
-#if JucePlugin_IsMidiEffect
-    return true;
-#else
-    return false;
-#endif
-}
-
-double LatentAudioVSTAudioProcessor::getTailLengthSeconds() const
-{
-    return 0.0;
-}
-
-int LatentAudioVSTAudioProcessor::getNumPrograms()
-{
-    return 1;
-}
-
-int LatentAudioVSTAudioProcessor::getCurrentProgram()
-{
-    return 0;
-}
-
-void LatentAudioVSTAudioProcessor::setCurrentProgram(int index)
-{
-}
-
-const juce::String LatentAudioVSTAudioProcessor::getProgramName(int index)
-{
-    return {};
-}
-
-void LatentAudioVSTAudioProcessor::changeProgramName(int index, const juce::String& newName)
-{
+    return { map.minX + nx * map.rangeX(), map.maxY - ny * map.rangeY() };
 }
 
 //==============================================================================
-void LatentAudioVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+// Position: parameters <-> cursor
+void LatentAudioVSTAudioProcessor::parameterChanged (const juce::String& id, float)
 {
-    juce::Logger::writeToLog("[prepareToPlay] === START ===");
-    juce::Logger::writeToLog("[prepareToPlay] this=" + juce::String::toHexString((juce::int64)this));
-    juce::Logger::writeToLog("[prepareToPlay] isNonRealtime=" + juce::String(isNonRealtime() ? "TRUE (EXPORT MODE)" : "FALSE (REALTIME)"));
-    juce::Logger::writeToLog("[prepareToPlay] Sample rate: " + juce::String(sampleRate));
-    juce::Logger::writeToLog("[prepareToPlay] Buffer size: " + juce::String(samplesPerBlock));
-    juce::Logger::writeToLog("[prepareToPlay] decoder.isModelLoaded=" + juce::String(decoder.isModelLoaded() ? "TRUE" : "FALSE"));
-    juce::Logger::writeToLog("[prepareToPlay] soundMap.getLatentDim=" + juce::String(soundMap.getLatentDim()));
-    juce::Logger::writeToLog("[prepareToPlay] hasValidAudio=" + juce::String(hasValidAudio.load() ? "TRUE" : "FALSE"));
-    juce::Logger::writeToLog("[prepareToPlay] LatentDecoder instance count: " + juce::String(LatentDecoder::getInstanceCount()));
-
-    currentSampleRate = sampleRate;
-
-    // Detect offline (export) mode for synchronous inference
-    isOfflineMode.store(isNonRealtime());
-    lastOfflineX = -999.0f;  // Reset offline position tracking
-    lastOfflineY = -999.0f;
-
-    // When entering offline (export) mode, reset to a clean state so the export
-    // starts from scratch rather than mid-crossfade from the realtime session.
-    if (isOfflineMode.load())
-    {
-        playbackPosition.store(-1);
-        envState = EnvelopeState::Idle;
-        currentEnvLevel = 0.0f;
-        fractionalPosition = 0.0f;
-        isCrossfading = false;
-        triggerCrossfade.store(false);
-        hasValidAudio.store(false);
-    }
-
-    // Pre-allocate buffers for synchronous inference in offline mode
-    if (isOfflineMode.load())
-    {
-        int latentDim = soundMap.getLatentDim();
-        if (latentDim > 0)
-        {
-            offlineLatentBuffer.resize(latentDim);
-            offlineAudioBuffer.reserve(44100);  // Reserve for typical audio length
-        }
-        juce::Logger::writeToLog("[prepareToPlay] Offline mode enabled - synchronous inference active");
-    }
-
-    // Mark for potential auto-generation on first process
-    isFirstProcess.store(true);
-
-    // Initialize buffers if we don't have valid audio
-    if (!hasValidAudio.load())
-    {
-        juce::ScopedLock sl(bufferLock);
-        soundBuffers[0].setSize(2, 0, false, false, false);
-        soundBuffers[1].setSize(2, 0, false, false, false);
-        soundBuffers[0].clear();
-        soundBuffers[1].clear();
-    }
-
-    // Reset filters for new sample rate
-    {
-        const juce::ScopedLock sl(filterLock);
-        lpFilter1.reset();
-        lpFilter2.reset();
-        lastCutoff = -1.0f;
-        lastReso = -1.0f;
-    }
-
-    juce::Logger::writeToLog("[prepareToPlay] === END ===");
+    if (id == "positionX" || id == "positionY")
+        applyPositionParameters();
 }
 
-//==============================================================================
-void LatentAudioVSTAudioProcessor::releaseResources()
+void LatentAudioVSTAudioProcessor::applyPositionParameters()
 {
-    juce::Logger::writeToLog("[releaseResources] === CALLED ===");
-    juce::Logger::writeToLog("[releaseResources] this=" + juce::String::toHexString((juce::int64)this));
-    juce::Logger::writeToLog("[releaseResources] hasValidAudio=" + juce::String(hasValidAudio.load() ? "TRUE" : "FALSE"));
-    juce::Logger::writeToLog("[releaseResources] isNonRealtime=" + juce::String(isNonRealtime() ? "TRUE (EXPORT MODE)" : "FALSE (REALTIME)"));
-    juce::Logger::writeToLog("[releaseResources] LatentDecoder instance count: " + juce::String(LatentDecoder::getInstanceCount()));
-
-    // Don't clear buffers on releaseResources - they may be needed for state persistence
-    // The buffers will be properly cleared when loading a new model or on destruction
-}
-
-#ifndef JucePlugin_PreferredChannelConfigurations
-bool LatentAudioVSTAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
-{
-#if JucePlugin_IsMidiEffect
-    juce::ignoreUnused(layouts);
-    return true;
-#else
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-        && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
-        return false;
-
-#if ! JucePlugin_IsSynth
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
-        return false;
-#endif
-
-    return true;
-#endif
-}
-#endif
-
-//==============================================================================
-void LatentAudioVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
-{
-    juce::ScopedNoDenormals noDenormals;
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
-
-    // Add call counter for periodic logging (every 1000 calls)
-    static std::atomic<int> processBlockCounter{0};
-    int callCount = processBlockCounter.fetch_add(1);
-
-    /* LOGGING DISABLED FOR PERFORMANCE
-    if (callCount == 0 || callCount % 1000 == 0)
-    {
-        juce::Logger::writeToLog("[processBlock] Call #" + juce::String(callCount));
-        juce::Logger::writeToLog("[processBlock] this=" + juce::String::toHexString((juce::int64)this));
-        juce::Logger::writeToLog("[processBlock] hasValidAudio=" + juce::String(hasValidAudio.load() ? "TRUE" : "FALSE"));
-        juce::Logger::writeToLog("[processBlock] playbackPosition=" + juce::String(playbackPosition.load()));
-        juce::Logger::writeToLog("[processBlock] activeBufferIndex=" + juce::String(activeBufferIndex.load()));
-        juce::Logger::writeToLog("[processBlock] isNonRealtime=" + juce::String(isNonRealtime() ? "TRUE (EXPORT MODE)" : "FALSE (REALTIME)"));
-        juce::Logger::writeToLog("[processBlock] decoder.isModelLoaded()=" + juce::String(decoder.isModelLoaded() ? "TRUE" : "FALSE"));
-        juce::Logger::writeToLog("[processBlock] soundMap.getLatentDim()=" + juce::String(soundMap.getLatentDim()));
-    }
-    */
-
-    // Clear output buffer
-    for (int ch = 0; ch < totalNumOutputChannels; ++ch)
-        buffer.clear(ch, 0, buffer.getNumSamples());
-
-    // OFFLINE MODE: Run synchronous inference when position changes significantly
-    if (isOfflineMode.load() && decoder.isModelLoaded() && soundMap.getLatentDim() > 0)
-    {
-        // Skip if crossfade is already in progress to prevent crackles
-        if (isCrossfading)
-        {
-            // Update tracking but don't trigger new inference
-            lastOfflineX = currentX.load();
-            lastOfflineY = currentY.load();
-        }
-        else
-        {
-            float x = currentX.load();
-            float y = currentY.load();
-
-            // Always trigger on position changes (no threshold) - matches real-time behavior
-            // Also trigger on first call (lastOfflineX/Y initialized to -999)
-            bool isFirstCall = (lastOfflineX < -900.0f);
-            bool positionChanged = (x != lastOfflineX || y != lastOfflineY);
-
-            if (isFirstCall || positionChanged)
-            {
-                processOfflinePositionChange(x, y);
-            }
-        }
-    }
-
-    // COMMON PLAYBACK CODE variables
-    int currentPos = playbackPosition.load();
-    double sampleRate = getSampleRate();
-
-    // MAIN PROCESSING
-    {
-
-        // First-process auto-generation
-        if (isFirstProcess.load())
-        {
-            isFirstProcess.store(false);
-
-            if (!hasValidAudio.load() && decoder.isModelLoaded() && soundMap.getLatentDim() > 0)
-            {
-                juce::Logger::writeToLog("[processBlock] Auto-generating audio for playback");
-
-                float x = currentX.load();
-                float y = currentY.load();
-
-                if (x == 0.0f && y == 0.0f && !soundMap.getPoints().empty())
-                {
-                    const auto& firstPoint = soundMap.getPoints()[0];
-                    x = firstPoint.x;
-                    y = firstPoint.y;
-                    currentX.store(x);
-                    currentY.store(y);
-                }
-
-                triggerInference(x, y, false);
-                // Inference is async - onInferenceFinished will start playback when ready
-                // NEVER sleep on the audio thread
-            }
-        }
-
-        // MIDI handling
-        if (triggerOnMidi.load())
-        {
-            midiActivityCounter += buffer.getNumSamples();
-
-            if (midiActivityCounter > 2205)
-            {
-                midiActive.store(false);
-                midiActivityCounter = 0;
-            }
-
-            for (const auto metadata : midiMessages)
-            {
-                if (metadata.getMessage().isNoteOn())
-                {
-                    midiActive.store(true);
-                    midiActivityCounter = 0;
-
-                    if (hasValidAudio.load())
-                    {
-                        playbackPosition.store(0);
-                        fractionalPosition = 0.0f;
-                        envState = EnvelopeState::Attack;
-                    }
-                    else
-                    {
-                        triggerInference(currentX.load(), currentY.load(), false);
-                    }
-                }
-                else if (metadata.getMessage().isNoteOff())
-                {
-                    midiActive.store(true);
-                    midiActivityCounter = 0;
-                    releaseNote();
-                }
-            }
-        }
-
-        // BACKGROUND INFERENCE
-        if (decoder.isModelLoaded() && soundMap.getLatentDim() > 0)
-        {
-            float rate = inferenceRate.load();
-
-            if (rate == 0.0f)
-            {
-                // Immediate background inference: trigger on position change
-                if (backgroundPositionChanged)
-                {
-                    triggerInference(currentX.load(), currentY.load(), false);
-                    backgroundPositionChanged = false;
-                }
-            }
-            else
-            {
-                // Rate-limited background inference: use counter + position change check
-                paramUpdateCounter -= (float)buffer.getNumSamples();
-                if (paramUpdateCounter <= 0.0f && backgroundPositionChanged)
-                {
-                    triggerInference(currentX.load(), currentY.load(), false);
-                    paramUpdateCounter = (float)getSampleRate() / rate; // Reset counter
-                    backgroundPositionChanged = false;
-                }
-                else if (paramUpdateCounter < 0.0f)
-                {
-                    // Reset counter even if no position change
-                    paramUpdateCounter = (float)getSampleRate() / rate;
-                }
-            }
-        }
-    }
-
-    // PLAYBACK CODE
-    if (currentPos < 0)
-        return;
-
-    if (!hasValidAudio.load())
-    {
-        playbackPosition.store(-1);
-        envState = EnvelopeState::Idle;
-        return;
-    }
-
-    float baseSpeed = playbackSpeed.load();
-    float tuneMultiplier = fineTuneMultiplier.load();
-    float speed = baseSpeed * tuneMultiplier;
-
-    float xfadeFactor = crossfade.load();
-    float gainVal = outputGain.load();
-    float mixVal = mixAmount.load();
-
-    float atk = attackTime.load();
-    float dec = decayTime.load();
-    float sus = sustainLevel.load();
-    float rel = releaseTime.load();
-
-    if (atk < 0.001f) atk = 0.001f;
-    if (dec < 0.001f) dec = 0.001f;
-    if (rel < 0.001f) rel = 0.001f;
-
-    float attackInc = 1.0f / (atk * (float)sampleRate);
-    float decayDec = 1.0f / (dec * (float)sampleRate);
-    float releaseDec = 1.0f / (rel * (float)sampleRate);
-
-    if (currentPos >= 0)
-    {
-        if (triggerCrossfade.load())
-        {
-            if (!isCrossfading)
-            {
-                // Only start a fresh crossfade if one isn't already in progress.
-                // If we're already crossfading the new content is already in the back
-                // buffer — just let the current fade finish rather than resetting to
-                // 0 every time a new inference arrives (which would cause the fade to
-                // never complete and the active buffer to never flip during rapid automation).
-                isCrossfading = true;
-                crossfadePosition = 0.0f;
-                float crossfadeSamples = (float)getSampleRate() * 0.05f;
-                if (crossfadeSamples < 1.0f) crossfadeSamples = 1.0f;
-                crossfadeIncrement = 1.0f / crossfadeSamples;
-            }
-            triggerCrossfade.store(false);
-        }
-
-        const juce::ScopedLock sl(bufferLock);
-
-        int activeIndex = activeBufferIndex.load();
-        int nextIndex = 1 - activeIndex;
-
-        const auto* activeBuf = &soundBuffers[activeIndex];
-        const auto* nextBuf = &soundBuffers[nextIndex];
-
-        int totalGenerated = activeBuf->getNumSamples();
-
-        if (isCrossfading && nextBuf->getNumSamples() == 0)
-            isCrossfading = false;
-
-        if (totalGenerated == 0) return;
-
-        float startPos = sampleStart.load();
-        int loopStartSample = (int)(startPos * (float)totalGenerated);
-        int loopEndSample = juce::jmin(totalGenerated, (int)(sampleLength.load() * (float)totalGenerated));
-
-        auto* leftOut = buffer.getWritePointer(0);
-        auto* rightOut = buffer.getWritePointer(1);
-
-        const auto* activeL = activeBuf->getReadPointer(0);
-        const auto* activeR = activeBuf->getReadPointer(1);
-
-        const float* nextL = nullptr;
-        const float* nextR = nullptr;
-
-        if (isCrossfading)
-        {
-            nextL = nextBuf->getReadPointer(0);
-            nextR = nextBuf->getReadPointer(1);
-        }
-
-        int outputSamples = buffer.getNumSamples();
-        int samplesWritten = 0;
-
-        for (int i = 0; i < outputSamples; ++i)
-        {
-            if (currentPos < 0) break;
-
-            if (fractionalPosition >= loopEndSample)
-            {
-                if (isLatch.load())
-                {
-                    fractionalPosition = (float)loopStartSample;
-                }
-                else
-                {
-                    envState = EnvelopeState::Release;
-                    fractionalPosition = loopEndSample - 1.0f;
-                }
-            }
-            if (fractionalPosition < loopStartSample)
-                fractionalPosition = (float)loopStartSample;
-
-            int idxA = (int)fractionalPosition;
-            int idxB = idxA + 1;
-            float alpha = fractionalPosition - (float)idxA;
-
-            idxB = juce::jmin(idxB, (int)loopEndSample - 1);
-
-            float lA = activeL[idxA];
-            float lB = activeL[idxB];
-            float sigL = lA + alpha * (lB - lA);
-
-            float rA = activeR[idxA];
-            float rB = activeR[idxB];
-            float sigR = rA + alpha * (rB - rA);
-
-            if (xfadeFactor > 0.001f)
-            {
-                float loopDuration = (float)(loopEndSample - loopStartSample);
-                float relPos = fractionalPosition - loopStartSample;
-                float timeToEnd = loopDuration - relPos;
-                float xfadeLen = loopDuration * xfadeFactor;
-
-                if (timeToEnd < xfadeLen)
-                {
-                    float distFromEnd = xfadeLen - timeToEnd;
-                    float wrapPos = loopStartSample + distFromEnd;
-
-                    int wIdxA = (int)wrapPos;
-                    int wIdxB = wIdxA + 1;
-                    float wAlpha = wrapPos - (float)wIdxA;
-
-                    wIdxB = juce::jmin(wIdxB, totalGenerated - 1);
-
-                    float wLA = activeL[wIdxA];
-                    float wLB = activeL[wIdxB];
-                    float wSigL = wLA + wAlpha * (wLB - wLA);
-
-                    float wRA = activeR[wIdxA];
-                    float wRB = activeR[wIdxB];
-                    float wSigR = wRA + wAlpha * (wRB - wRA);
-
-                    float mix = distFromEnd / xfadeLen;
-                    sigL = sigL * (1.0f - mix) + wSigL * mix;
-                    sigR = sigR * (1.0f - mix) + wSigR * mix;
-                }
-            }
-
-            if (isCrossfading)
-            {
-                int nTotal = nextBuf->getNumSamples();
-                int nIdxA = idxA % nTotal;
-                int nIdxB = idxB % nTotal;
-
-                float nLA = nextL[nIdxA];
-                float nLB = nextL[nIdxB];
-                float nextSigL = nLA + alpha * (nLB - nLA);
-
-                float nRA = nextR[nIdxA];
-                float nRB = nextR[nIdxB];
-                float nextSigR = nRA + alpha * (nRB - nRA);
-
-                sigL = sigL * (1.0f - crossfadePosition) + nextSigL * crossfadePosition;
-                sigR = sigR * (1.0f - crossfadePosition) + nextSigR * crossfadePosition;
-
-                crossfadePosition += crossfadeIncrement;
-                if (crossfadePosition >= 1.0f)
-                {
-                    isCrossfading = false;
-                    activeBufferIndex.store(nextIndex);
-                    activeIndex = nextIndex;
-                    nextIndex = 1 - activeIndex;
-                    activeBuf = &soundBuffers[activeIndex];
-                    activeL = activeBuf->getReadPointer(0);
-                    activeR = activeBuf->getReadPointer(1);
-                }
-            }
-
-            switch (envState)
-            {
-            case EnvelopeState::Idle:
-                currentEnvLevel = 0.0f;
-                break;
-
-            case EnvelopeState::Attack:
-                currentEnvLevel += attackInc;
-                if (currentEnvLevel >= 1.0f)
-                {
-                    currentEnvLevel = 1.0f;
-                    envState = EnvelopeState::Decay;
-                }
-                break;
-
-            case EnvelopeState::Decay:
-                currentEnvLevel -= decayDec;
-                if (currentEnvLevel <= sus)
-                {
-                    currentEnvLevel = sus;
-                    envState = EnvelopeState::Sustain;
-                }
-                break;
-
-            case EnvelopeState::Sustain:
-                currentEnvLevel = sus;
-                break;
-
-            case EnvelopeState::Release:
-                currentEnvLevel -= releaseDec;
-                if (currentEnvLevel <= 0.0f)
-                {
-                    currentEnvLevel = 0.0f;
-                    envState = EnvelopeState::Idle;
-                    playbackPosition.store(-1);
-                }
-                break;
-            }
-
-            float finalGain = currentEnvLevel * gainVal;
-            float wetL = sigL * finalGain;
-            float wetR = sigR * finalGain;
-
-            leftOut[i] += wetL * mixVal;
-            rightOut[i] += wetR * mixVal;
-            samplesWritten = i + 1;
-
-            fractionalPosition += speed;
-
-            if (envState == EnvelopeState::Idle) break;
-        }
-
-        // Apply LP filter live (same code path for both realtime and offline export)
-        if (samplesWritten > 0)
-        {
-            float cutoff = juce::jlimit(20.0f, 20000.0f, lpCutoff.load());
-            float reso = lpReso.load();
-
-            if (cutoff != lastCutoff || reso != lastReso)
-            {
-                double Q = 0.707 + (double)reso * 10.0;
-                currentCoeffs = juce::IIRCoefficients::makeLowPass(currentSampleRate, (double)cutoff, Q);
-                lpFilter1.setCoefficients(currentCoeffs);
-                lpFilter2.setCoefficients(currentCoeffs);
-                lastCutoff = cutoff;
-                lastReso = reso;
-            }
-
-            // Two cascaded biquads for 4th-order LP on the mono content
-            lpFilter1.processSamples(leftOut, samplesWritten);
-            lpFilter2.processSamples(leftOut, samplesWritten);
-
-            // Mirror filtered mono to right channel (content is always mono)
-            juce::FloatVectorOperations::copy(rightOut, leftOut, samplesWritten);
-        }
-
-        if (envState != EnvelopeState::Idle)
-            playbackPosition.store((int)fractionalPosition);
-    }
-}
-
-//==============================================================================
-void LatentAudioVSTAudioProcessor::setPlaybackSpeed(float newSpeed)
-{
-    playbackSpeed.store(newSpeed);
-}
-
-void LatentAudioVSTAudioProcessor::setFineTune(float multiplier)
-{
-    fineTuneMultiplier.store(multiplier);
-}
-
-void LatentAudioVSTAudioProcessor::setCrossfade(float amount)
-{
-    crossfade.store(amount);
-}
-
-void LatentAudioVSTAudioProcessor::setLatch(bool shouldLatch)
-{
-    isLatch.store(shouldLatch);
-}
-
-void LatentAudioVSTAudioProcessor::setGain(float newGain)
-{
-    outputGain.store(newGain);
-}
-
-void LatentAudioVSTAudioProcessor::setMix(float wetAmount)
-{
-    mixAmount.store(juce::jlimit(0.0f, 1.0f, wetAmount));
-}
-
-void LatentAudioVSTAudioProcessor::setFilterCutoff(float cutoffHz)
-{
-    lpCutoff.store(cutoffHz);
-    // Filter is applied live in processBlock - no inference needed
-}
-
-void LatentAudioVSTAudioProcessor::setFilterResonance(float reso)
-{
-    lpReso.store(juce::jlimit(0.0f, 1.0f, reso));
-    // Filter is applied live in processBlock - no inference needed
-}
-
-void LatentAudioVSTAudioProcessor::setTriggerOnMidi(bool shouldTrigger)
-{
-    triggerOnMidi.store(shouldTrigger);
-}
-
-void LatentAudioVSTAudioProcessor::setSampleLength(float len)
-{
-    sampleLength.store(juce::jlimit(0.1f, 1.0f, len));
-}
-
-void LatentAudioVSTAudioProcessor::setSampleStart(float start)
-{
-    sampleStart.store(juce::jlimit(0.0f, 0.9f, start));
-}
-
-void LatentAudioVSTAudioProcessor::setPositionX(float normalizedX)
-{
-    // Skip if we're syncing from triggerInference to avoid feedback loop
+    // May run on the audio thread (host automation): atomics only.
     if (syncingPositionParams.load())
-    {
         return;
-    }
 
-    float minX = soundMap.getMinX();
-    float maxX = soundMap.getMaxX();
-    float actualX = minX + normalizedX * (maxX - minX);
+    const float minX = mapMinX.load(), maxX = mapMaxX.load();
+    const float minY = mapMinY.load(), maxY = mapMaxY.load();
+    currentX.store (minX + pPosX->load() * (maxX - minX));
+    currentY.store (maxY - pPosY->load() * (maxY - minY));
 
-    // Offline mode: just update position, let processBlock handle sync inference
-    if (isOfflineMode.load())
-    {
-        currentX.store(actualX);
-        return;
-    }
-
-    // Check if position changed for background inference tracking
-    if (std::abs(actualX - lastBackgroundX) > 0.001f ||
-        std::abs(currentY.load() - lastBackgroundY) > 0.001f)
-    {
-        backgroundPositionChanged = true;
-        lastBackgroundX = actualX;
-        lastBackgroundY = currentY.load();
-    }
-
-    // Morph inactive: trigger inference immediately.
-    // Pass false — we're responding to a parameter callback, not user cursor drag,
-    // so we must not echo back via setValueNotifyingHost.
-    triggerInference(actualX, currentY.load(), false);
+    // In free mode moving the position auditions it; in "Play on Note" mode it
+    // only changes what the next note will play.
+    requestInference (pTriggerOnMidi->load() < 0.5f);
 }
 
-void LatentAudioVSTAudioProcessor::setPositionY(float normalizedY)
+void LatentAudioVSTAudioProcessor::requestInference (bool audition)
 {
-    // Skip if we're syncing from triggerInference to avoid feedback loop
-    if (syncingPositionParams.load())
+    if (audition)
+        playOnArrival.store (true);
+    requestSeq.fetch_add (1);
+
+    // Waking takes a mutex, so only do it off the audio thread; otherwise the
+    // inference thread's 2 ms poll picks the request up.
+    if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
+        if (mm->isThisTheMessageThread())
+            inferenceThread.wake();
+}
+
+void LatentAudioVSTAudioProcessor::setCursorAndSyncHost (float x, float y, bool notifyHost)
+{
+    auto map = soundMap.snapshot();
+    if (map != nullptr)
     {
-        return;
+        x = juce::jlimit (map->minX, map->maxX, x);
+        y = juce::jlimit (map->minY, map->maxY, y);
     }
 
-    float minY = soundMap.getMinY();
-    float maxY = soundMap.getMaxY();
-    float actualY = maxY - normalizedY * (maxY - minY);
+    currentX.store (x);
+    currentY.store (y);
 
-    // Offline mode: just update position, let processBlock handle sync inference
-    if (isOfflineMode.load())
+    if (map != nullptr && notifyHost)
     {
-        currentY.store(actualY);
-        return;
+        const auto n = mapToNormalized (*map, x, y);
+        syncingPositionParams.store (true);
+        parameters->getParameter ("positionX")->setValueNotifyingHost (n.x);
+        parameters->getParameter ("positionY")->setValueNotifyingHost (n.y);
+        syncingPositionParams.store (false);
     }
+}
 
-    // Check if position changed for background inference tracking
-    if (std::abs(currentX.load() - lastBackgroundX) > 0.001f ||
-        std::abs(actualY - lastBackgroundY) > 0.001f)
+//==============================================================================
+// UI interaction
+void LatentAudioVSTAudioProcessor::triggerFromUI (float mapX, float mapY, bool restart)
+{
+    // Wrap a drag in a gesture so hosts record it as one automation move.
+    if (! uiGestureActive)
     {
-        backgroundPositionChanged = true;
-        lastBackgroundX = currentX.load();
-        lastBackgroundY = actualY;
+        uiGestureActive = true;
+        parameters->getParameter ("positionX")->beginChangeGesture();
+        parameters->getParameter ("positionY")->beginChangeGesture();
     }
+    setCursorAndSyncHost (mapX, mapY, true);
+    requestInference (true);
+    if (restart)
+        startRequested.store (true);
+}
 
-    // Morph inactive: trigger inference immediately (no host sync — param callback).
-    triggerInference(currentX.load(), actualY, false);
+void LatentAudioVSTAudioProcessor::releaseFromUI()
+{
+    if (uiGestureActive)
+    {
+        uiGestureActive = false;
+        parameters->getParameter ("positionX")->endChangeGesture();
+        parameters->getParameter ("positionY")->endChangeGesture();
+    }
+    // Mouse-up does not cut the sound: a click auditions the whole one-shot
+    // (like a drum pad). Hold loops until switched off; MIDI note-off still gates.
+}
+
+void LatentAudioVSTAudioProcessor::moveCursorFromUI (float mapX, float mapY)
+{
+    setCursorAndSyncHost (mapX, mapY, true);
+    requestInference (false);
 }
 
 void LatentAudioVSTAudioProcessor::triggerRandomPosition()
 {
-    if (soundMap.getPoints().empty()) return;
+    auto map = soundMap.snapshot();
+    if (map == nullptr || map->points.empty())
+        return;
 
-    juce::Random rand;
-    float minX = soundMap.getMinX();
-    float maxX = soundMap.getMaxX();
-    float minY = soundMap.getMinY();
-    float maxY = soundMap.getMaxY();
+    // Land near a real sound (uniform positions often fall in empty space).
+    auto& rng = juce::Random::getSystemRandom();
+    const auto& pt = map->points[(size_t) rng.nextInt ((int) map->points.size())];
+    const float jx = (rng.nextFloat() - 0.5f) * 0.04f * map->rangeX();
+    const float jy = (rng.nextFloat() - 0.5f) * 0.04f * map->rangeY();
+    triggerFromUI (pt.x + jx, pt.y + jy);
 
-    float randomX = minX + rand.nextFloat() * (maxX - minX);
-    float randomY = minY + rand.nextFloat() * (maxY - minY);
+    // Close the gesture but let the sound play out (a release would cut it off).
+    if (uiGestureActive)
+    {
+        uiGestureActive = false;
+        parameters->getParameter ("positionX")->endChangeGesture();
+        parameters->getParameter ("positionY")->endChangeGesture();
+    }
+}
 
-    triggerInference(randomX, randomY);
+void LatentAudioVSTAudioProcessor::resetParametersToDefaults()
+{
+    for (auto* param : getParameters())
+    {
+        auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (param);
+        if (ranged == nullptr)
+            continue;
+        const auto id = ranged->getParameterID();
+        if (id == "positionX" || id == "positionY")
+            continue;
+        ranged->beginChangeGesture();
+        ranged->setValueNotifyingHost (ranged->getDefaultValue());
+        ranged->endChangeGesture();
+    }
+}
+
+void LatentAudioVSTAudioProcessor::injectDecodedAudio (std::vector<float> audio)
+{
+    if (audio.empty() || ! std::all_of (audio.begin(), audio.end(), [] (float v) { return std::isfinite (v); }))
+        return;
+    publishAudio (std::move (audio), modelGeneration.load());
+}
+
+void LatentAudioVSTAudioProcessor::copyDisplayWaveform (std::vector<float>& dest) const
+{
+    const juce::ScopedLock sl (displayLock);
+    dest = displayWaveform;
 }
 
 //==============================================================================
-void LatentAudioVSTAudioProcessor::triggerInference(float x, float y, bool syncToHost)
+// Inference thread
+void LatentAudioVSTAudioProcessor::serviceInference()
 {
-    // juce::Logger::writeToLog("[triggerInference] Called with x=" + juce::String(x) + ", y=" + juce::String(y));
-    // juce::Logger::writeToLog("[triggerInference] soundMap.getLatentDim()=" + juce::String(soundMap.getLatentDim()));
-    // juce::Logger::writeToLog("[triggerInference] decoder.isModelLoaded()=" + juce::String(decoder.isModelLoaded() ? "TRUE" : "FALSE"));
-
-    if (soundMap.getLatentDim() == 0)
-    {
-        // juce::Logger::writeToLog("[triggerInference] FAIL: soundMap latentDim is 0");
+    // During offline rendering processBlock decodes synchronously instead.
+    if (isNonRealtime())
         return;
-    }
 
-    // Update active position tracking
-    currentX.store(x);
-    currentY.store(y);
+    const auto seq = requestSeq.load();
+    if (seq == servicedSeq)
+        return;
 
-    // Sync position parameters to APVTS so DAW automation tracks the current position
-    float minX = soundMap.getMinX();
-    float maxX = soundMap.getMaxX();
-    float minY = soundMap.getMinY();
-    float maxY = soundMap.getMaxY();
+    const float rate = pInferenceRate->load();
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    if (rate > 0.0f && now - lastDecodeMs < 1000.0 / rate)
+        return; // rate-limited: the poll retries shortly with the newest position
 
-    float rangeX = maxX - minX;
-    float rangeY = maxY - minY;
+    servicedSeq = seq;
+    const auto generation = modelGeneration.load();
 
-    // Only notify the host when triggered by direct user interaction (cursor drag,
-    // random button, etc.) for automation recording.  When called from a parameter
-    // callback (setPositionX/Y) or from processBlock, skip this: setValueNotifyingHost
-    // fires an async parameterChanged callback AFTER syncingPositionParams is already
-    // cleared, causing a stale-position re-trigger that fights the live automation.
-    if (syncToHost && rangeX > 0.0001f && rangeY > 0.0001f)
-    {
-        float normalizedX = juce::jlimit(0.0f, 1.0f, (x - minX) / rangeX);
-        float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - y) / rangeY); // Y is inverted
+    std::vector<float> audio;
+    if (! decodeAt (currentX.load(), currentY.load(), audio))
+        return;
 
-        syncingPositionParams.store(true);
-        if (auto* paramX = parameters->getParameter("positionX"))
-            paramX->setValueNotifyingHost(normalizedX);
-        if (auto* paramY = parameters->getParameter("positionY"))
-            paramY->setValueNotifyingHost(normalizedY);
-        syncingPositionParams.store(false);
-    }
-
-    if (playbackPosition.load() < 0)
-    {
-        playbackPosition.store(0);
-        fractionalPosition = 0.0f;
-    }
-
-    if (envState == EnvelopeState::Idle || envState == EnvelopeState::Release)
-    {
-        envState = EnvelopeState::Attack;
-    }
-
-    auto vector = soundMap.getInterpolatedVector(x, y);
-    // juce::Logger::writeToLog("[triggerInference] interpolated vector size=" + juce::String(vector.size()));
-    inferenceThread.trigger(vector);
+    lastDecodeMs = juce::Time::getMillisecondCounterHiRes();
+    publishAudio (std::move (audio), generation);
 }
 
-void LatentAudioVSTAudioProcessor::releaseNote()
+bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, std::vector<float>& audio) const
 {
-    if (isLatch.load()) return;
+    auto map = soundMap.snapshot();
+    if (map == nullptr || map->points.empty())
+        return false;
 
-    if (envState != EnvelopeState::Idle)
-    {
-        envState = EnvelopeState::Release;
-    }
+    const auto latent = map->interpolate (x, y);
+    if (! decoder.decode (latent, audio))
+        return false;
+
+    return postProcess (audio);
 }
 
-void LatentAudioVSTAudioProcessor::processOfflinePositionChange(float x, float y)
+bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
 {
-    // Synchronous inference for offline/export mode
-    // This blocks until inference is complete - necessary for correct export
+    if (audio.empty())
+        return false;
 
-    if (soundMap.getLatentDim() == 0 || !decoder.isModelLoaded())
-        return;
+    for (float s : audio)
+        if (! std::isfinite (s))
+            return false;
 
-    // juce::Logger::writeToLog("[processOfflinePositionChange] Sync inference at (" + juce::String(x) + ", " + juce::String(y) + ")");
+    // Trim the inaudible tail with a short fade so loops/one-shots end cleanly.
+    const float threshold = juce::Decibels::decibelsToGain (-60.0f);
+    const int n = (int) audio.size();
+    int lastHot = -1;
+    for (int i = n - 1; i >= 0; --i)
+        if (std::abs (audio[(size_t) i]) > threshold) { lastHot = i; break; }
 
-    // Get interpolated latent vector
-    auto latentVector = soundMap.getInterpolatedVector(x, y);
-    if (latentVector.empty())
-        return;
-
-    // Run synchronous decode (blocking call)
-    std::vector<float> rawAudio;
-    bool decodeSuccess = decoder.decode(latentVector, rawAudio);
-    if (!decodeSuccess || rawAudio.empty())
+    if (lastHot < 0)
     {
-        // juce::Logger::writeToLog("[processOfflinePositionChange] Decode returned empty audio");
-        return;
+        std::fill (audio.begin(), audio.end(), 0.0f);
+        return true;
     }
 
-    // Validate audio data
-    bool hasInvalidData = false;
-    float maxAmp = 0.0f;
-    for (float sample : rawAudio)
+    if (lastHot < n - 882)
     {
-        if (!std::isfinite(sample))
-        {
-            hasInvalidData = true;
-            break;
-        }
-        maxAmp = std::max(maxAmp, std::abs(sample));
+        const int fadeStart = lastHot + 10;
+        const int fadeLen = 512;
+        const int fadeEnd = std::min (fadeStart + fadeLen, n);
+        for (int i = fadeStart; i < fadeEnd; ++i)
+            audio[(size_t) i] *= 1.0f - (float) (i - fadeStart) / (float) fadeLen;
+        std::fill (audio.begin() + fadeEnd, audio.end(), 0.0f);
     }
 
-    if (hasInvalidData)
-    {
-        // juce::Logger::writeToLog("[processOfflinePositionChange] Invalid data (NaN/Inf) - aborting");
-        return;
-    }
+    // Always end at zero.
+    const int rampLen = std::min (32, n);
+    for (int i = 0; i < rampLen; ++i)
+        audio[(size_t) (n - rampLen + i)] *= 1.0f - (float) (i + 1) / (float) rampLen;
 
-    // FILTER RESET REMOVED TO PREVENT CRACKLES
-    /*
-    {
-        const juce::ScopedLock sl(filterLock);
-        lpFilter1.reset();
-        lpFilter2.reset();
-    }
-    */
+    float peak = 0.0f;
+    for (float s : audio)
+        peak = std::max (peak, std::abs (s));
+    if (peak > 1.0f)
+        for (float& s : audio)
+            s /= peak;
 
-    // Apply post-processing
-    std::vector<float> processedAudio = rawAudio;
-    applyPostProcessing(processedAudio);
-
-    // Copy to back buffer and trigger crossfade (same as realtime mode)
-    {
-        juce::ScopedLock sl(bufferLock);
-
-        int backIndex = 1 - activeBufferIndex.load();
-        auto& backBuffer = soundBuffers[backIndex];
-
-        if (backBuffer.getNumSamples() != (int)processedAudio.size())
-            backBuffer.setSize(2, (int)processedAudio.size(), false, false, false);
-
-        backBuffer.clear();
-
-        for (int ch = 0; ch < backBuffer.getNumChannels(); ++ch)
-            juce::FloatVectorOperations::copy(backBuffer.getWritePointer(ch),
-                processedAudio.data(),
-                (int)processedAudio.size());
-
-        triggerCrossfade.store(true);
-    }
-
-    // In offline mode always do a hard swap - crossfading during export produces
-    // different output than realtime playback and causes the export mismatch.
-    {
-        int backIndex = 1 - activeBufferIndex.load();
-        activeBufferIndex.store(backIndex);
-        triggerCrossfade.store(false);
-        isCrossfading = false;
-    }
-
-    if (playbackPosition.load() < 0)
-    {
-        playbackPosition.store(0);
-        fractionalPosition = 0.0f;
-    }
-
-    hasValidAudio.store(true);
-
-    if (envState == EnvelopeState::Idle || envState == EnvelopeState::Release)
-        envState = EnvelopeState::Attack;
-
-    // Update tracking
-    lastOfflineX = x;
-    lastOfflineY = y;
-
-    juce::Logger::writeToLog("[processOfflinePositionChange] Sync inference complete, samples=" +
-        juce::String((int)processedAudio.size()));
-}
-
-float LatentAudioVSTAudioProcessor::getPlaybackPositionNormalized() const
-{
-    int pos = playbackPosition.load();
-    int idx = activeBufferIndex.load();
-    int len = soundBuffers[idx].getNumSamples();
-
-    if (pos < 0 || len == 0)
-        return -1.0f;
-
-    return (float)pos / (float)len;
-}
-
-//==============================================================================
-
-
-//==============================================================================
-bool LatentAudioVSTAudioProcessor::hasEditor() const
-{
     return true;
 }
 
-juce::AudioProcessorEditor* LatentAudioVSTAudioProcessor::createEditor()
+void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uint32_t generation)
 {
-    return new LatentAudioVSTAudioProcessorEditor(*this);
+    if (generation != modelGeneration.load())
+        return; // decoded by a model that has since been replaced
+
+    {
+        const juce::ScopedLock sl (displayLock);
+        displayWaveform = audio;
+    }
+    displayVersion.fetch_add (1);
+
+    {
+        const juce::SpinLock::ScopedLockType sl (pendingLock);
+        std::swap (pendingAudio, audio);
+        pendingGeneration = generation;
+        pendingReady.store (true, std::memory_order_release);
+    }
+    // `audio` now holds the previous pending buffer and is freed here, off the audio thread.
 }
 
 //==============================================================================
-// ============================================================================
-// SIMPLIFIED: State Management (APVTS handles this automatically!)
-// ============================================================================
-
-void LatentAudioVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+// Model loading
+bool LatentAudioVSTAudioProcessor::findModelFiles (const juce::File& target, juce::File& onnx, juce::File& json, juce::String& error)
 {
-    juce::Logger::writeToLog("[getStateInformation] Saving state...");
-
-    // APVTS handles parameter state automatically
-    auto state = parameters->copyState();
-
-    // Add custom data (model paths, cursor position)
-    juce::String modelPathStr = modelPath.getFullPathName();
-    juce::String mapPathStr = soundMapPath.getFullPathName();
-
-    juce::Logger::writeToLog("[getStateInformation] Saving modelPath: " + modelPathStr);
-    juce::Logger::writeToLog("[getStateInformation] Saving soundMapPath: " + mapPathStr);
-    juce::Logger::writeToLog("[getStateInformation] Saving cursor: (" + juce::String(currentX.load()) + ", " + juce::String(currentY.load()) + ")");
-
-    state.setProperty("modelPath", modelPathStr, nullptr);
-    state.setProperty("soundMapPath", mapPathStr, nullptr);
-    state.setProperty("currentX", currentX.load(), nullptr);
-    state.setProperty("currentY", currentY.load(), nullptr);
-
-    // Store audio data as Base64 in the XML (no custom binary framing)
-    if (hasValidAudio.load())
+    if (! target.exists())
     {
-        juce::Logger::writeToLog("[getStateInformation] Encoding audio buffers as Base64...");
+        error = "Not found: " + target.getFullPathName();
+        return false;
+    }
+    const auto folder = target.isDirectory() ? target : target.getParentDirectory();
 
-        state.setProperty("hasValidAudio", true, nullptr);
-        state.setProperty("activeBufferIndex", activeBufferIndex.load(), nullptr);
-        state.setProperty("playbackPosition", playbackPosition.load(), nullptr);
-        state.setProperty("envState", static_cast<int>(envState), nullptr);
+    auto pick = [&folder] (const juce::String& wildcard, const juce::String& preferred) -> juce::File
+    {
+        auto preferredFile = folder.getChildFile (preferred);
+        if (preferredFile.existsAsFile())
+            return preferredFile;
+        auto files = folder.findChildFiles (juce::File::findFiles, false, wildcard);
+        files.sort();
+        return files.isEmpty() ? juce::File() : files.getFirst();
+    };
 
-        juce::ScopedLock sl(bufferLock);
-        for (int bufIdx = 0; bufIdx < 2; ++bufIdx)
+    onnx = target.hasFileExtension ("onnx") ? target : pick ("*.onnx", "latent_decoder.onnx");
+    json = target.hasFileExtension ("json") ? target : pick ("*.json", "sound_map.json");
+
+    if (! onnx.existsAsFile())
+        error = "No .onnx model found in " + folder.getFileName();
+    else if (! json.existsAsFile())
+        error = "No sound map (.json) found in " + folder.getFileName();
+    return error.isEmpty();
+}
+
+void LatentAudioVSTAudioProcessor::loadModelFolderAsync (const juce::File& folderOrFile)
+{
+    const auto token = loadToken.fetch_add (1) + 1;
+    loadInProgress.store (true);
+    {
+        const juce::ScopedLock sl (statusLock);
+        status.state = LoadState::Loading;
+        status.folder = folderOrFile.isDirectory() ? folderOrFile : folderOrFile.getParentDirectory();
+        status.message = "Loading " + status.folder.getFileName() + "...";
+    }
+    loaderPool.addJob ([this, folderOrFile, token] { runLoadJob (folderOrFile, false, token); });
+}
+
+void LatentAudioVSTAudioProcessor::runLoadJob (juce::File target, bool keepRestoredAudio, uint32_t token)
+{
+    auto fail = [this, token] (const juce::String& message)
+    {
+        LatentLog::write ("[Load] " + message);
+        if (token == loadToken.load())
         {
-            const auto& buffer = soundBuffers[bufIdx];
-            int numChannels = buffer.getNumChannels();
-            int numSamples = buffer.getNumSamples();
-
-            state.setProperty("buffer" + juce::String(bufIdx) + "_channels", numChannels, nullptr);
-            state.setProperty("buffer" + juce::String(bufIdx) + "_samples", numSamples, nullptr);
-
-            juce::Logger::writeToLog("[getStateInformation] Buffer " + juce::String(bufIdx) +
-                ": channels=" + juce::String(numChannels) + ", samples=" + juce::String(numSamples));
-
-            if (numChannels > 0 && numSamples > 0)
-            {
-                // Encode each channel as Base64
-                for (int ch = 0; ch < numChannels; ++ch)
-                {
-                    const float* data = buffer.getReadPointer(ch);
-                    juce::MemoryBlock audioBlock(data, sizeof(float) * numSamples);
-                    juce::String base64 = audioBlock.toBase64Encoding();
-                    state.setProperty("buffer" + juce::String(bufIdx) + "_ch" + juce::String(ch), base64, nullptr);
-                }
-            }
+            const juce::ScopedLock sl (statusLock);
+            status.state = LoadState::Failed;
+            status.message = message;
+            loadInProgress.store (false);
         }
+    };
 
-        juce::Logger::writeToLog("[getStateInformation] Audio data encoded as Base64");
+    juce::File onnx, json;
+    juce::String error;
+    if (! findModelFiles (target, onnx, json, error))
+        return fail (error);
+
+    auto map = SoundMapData::load (json, error);
+    if (map == nullptr)
+        return fail (error);
+
+    auto result = decoder.loadModel (onnx, map->latentDim);
+    if (! result.ok)
+        return fail (result.error);
+
+    if (token != loadToken.load())
+        return; // superseded by a newer load or an unload
+
+    soundMap.setData (map);
+    mapMinX.store (map->minX); mapMaxX.store (map->maxX);
+    mapMinY.store (map->minY); mapMaxY.store (map->maxY);
+    modelSampleRate.store (map->sampleRate);
+
+    if (! keepRestoredAudio)
+    {
+        modelGeneration.fetch_add (1);
+        resetRequested.store (true);
+        {
+            const juce::ScopedLock sl (displayLock);
+            displayWaveform.clear();
+        }
+        displayVersion.fetch_add (1);
+    }
+
+    // Keep the cursor if it lies on the new map, otherwise start on the first sound.
+    float x = currentX.load(), y = currentY.load();
+    if (x < map->minX || x > map->maxX || y < map->minY || y > map->maxY)
+    {
+        x = map->points.front().x;
+        y = map->points.front().y;
+    }
+    currentX.store (x);
+    currentY.store (y);
+
+    {
+        const juce::ScopedLock sl (statusLock);
+        status.state = LoadState::Ready;
+        status.folder = onnx.getParentDirectory();
+        status.message = juce::String ((int) map->points.size()) + " sounds";
+    }
+    loadInProgress.store (false);
+    LatentLog::write ("[Load] Loaded " + onnx.getFullPathName());
+
+    // Prime the buffer so the first note plays immediately (unless restored audio is kept).
+    if (! keepRestoredAudio || ! audioAvailable.load())
+    {
+        requestSeq.fetch_add (1);
+        inferenceThread.wake();
+    }
+
+    // Position parameters must follow the cursor; notifying the host belongs on the message thread.
+    juce::MessageManager::callAsync ([safeThis = juce::WeakReference<LatentAudioVSTAudioProcessor> (this)]
+    {
+        if (auto* self = safeThis.get())
+        {
+            const auto c = self->getCursor();
+            self->setCursorAndSyncHost (c.x, c.y, true);
+        }
+    });
+}
+
+void LatentAudioVSTAudioProcessor::unloadModel()
+{
+    loadToken.fetch_add (1); // cancels any load in flight
+    loadInProgress.store (false);
+    decoder.unload();
+    soundMap.clear();
+    modelGeneration.fetch_add (1);
+    resetRequested.store (true);
+    {
+        const juce::ScopedLock sl (displayLock);
+        displayWaveform.clear();
+    }
+    displayVersion.fetch_add (1);
+    {
+        const juce::ScopedLock sl (statusLock);
+        status = {};
+        status.message = "No model loaded";
+    }
+}
+
+LatentAudioVSTAudioProcessor::LoadStatus LatentAudioVSTAudioProcessor::getLoadStatus() const
+{
+    const juce::ScopedLock sl (statusLock);
+    return status;
+}
+
+bool LatentAudioVSTAudioProcessor::waitForModelLoad (int timeoutMs) const
+{
+    const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+    while (loadInProgress.load())
+    {
+        if (juce::Time::getMillisecondCounter() > deadline)
+            return false;
+        juce::Thread::sleep (5);
+    }
+    return true;
+}
+
+//==============================================================================
+// State
+void LatentAudioVSTAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    auto state = parameters->copyState();
+    state.setProperty ("stateVersion", kStateVersion, nullptr);
+    state.setProperty ("modelFolder", getLoadStatus().folder.getFullPathName(), nullptr);
+    state.setProperty ("currentX", currentX.load(), nullptr);
+    state.setProperty ("currentY", currentY.load(), nullptr);
+
+    // Keep the current sound (mono float32) so the project still plays even if
+    // the model folder is missing on another machine.
+    {
+        const juce::ScopedLock sl (displayLock);
+        if (! displayWaveform.empty())
+        {
+            juce::MemoryBlock mb (displayWaveform.data(), displayWaveform.size() * sizeof (float));
+            state.setProperty ("audio", mb.toBase64Encoding(), nullptr);
+        }
+    }
+
+    if (auto xml = state.createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void LatentAudioVSTAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr || ! xml->hasTagName (parameters->state.getType()))
+        return;
+
+    const auto state = juce::ValueTree::fromXml (*xml);
+
+    syncingPositionParams.store (true);
+    parameters->replaceState (state);
+    syncingPositionParams.store (false);
+
+    currentX.store ((float) state.getProperty ("currentX", 0.0f));
+    currentY.store ((float) state.getProperty ("currentY", 0.0f));
+
+    // Model location: v2 stores the folder, v1 stored the .onnx file path.
+    juce::File target;
+    if (state.hasProperty ("modelFolder"))
+        target = juce::File (state["modelFolder"].toString());
+    else if (state.hasProperty ("modelPath"))
+        target = juce::File (state["modelPath"].toString());
+
+    // Saved audio: v2 = "audio"; v1 = per-buffer, per-channel copies.
+    auto decodeFloats = [] (const juce::String& base64, int maxSamples)
+    {
+        std::vector<float> out;
+        juce::MemoryBlock mb;
+        if (base64.isNotEmpty() && mb.fromBase64Encoding (base64))
+        {
+            auto n = (int) (mb.getSize() / sizeof (float));
+            if (maxSamples > 0) n = std::min (n, maxSamples);
+            out.assign ((const float*) mb.getData(), (const float*) mb.getData() + n);
+        }
+        return out;
+    };
+
+    std::vector<float> audio;
+    if (state.hasProperty ("audio"))
+        audio = decodeFloats (state["audio"].toString(), 0);
+    else if ((bool) state.getProperty ("hasValidAudio", false))
+    {
+        const int idx = juce::jlimit (0, 1, (int) state.getProperty ("activeBufferIndex", 0));
+        const auto prefix = "buffer" + juce::String (idx);
+        audio = decodeFloats (state[prefix + "_ch0"].toString(), (int) state.getProperty (prefix + "_samples", 0));
+    }
+
+    // Drop whatever was playing, then hand over the restored sound.
+    modelGeneration.fetch_add (1);
+    resetRequested.store (true);
+    const bool haveAudio = ! audio.empty();
+    if (haveAudio)
+        injectDecodedAudio (std::move (audio));
+
+    if (target != juce::File() && (target.isDirectory() || target.existsAsFile()))
+    {
+        const auto token = loadToken.fetch_add (1) + 1;
+        loadInProgress.store (true);
+        {
+            const juce::ScopedLock sl (statusLock);
+            status.state = LoadState::Loading;
+            status.folder = target.isDirectory() ? target : target.getParentDirectory();
+            status.message = "Loading " + status.folder.getFileName() + "...";
+        }
+        loaderPool.addJob ([this, target, token, haveAudio] { runLoadJob (target, haveAudio, token); });
+    }
+    else if (target != juce::File())
+    {
+        const juce::ScopedLock sl (statusLock);
+        status.state = LoadState::Failed;
+        status.folder = target.isDirectory() ? target : target.getParentDirectory();
+        status.message = "Model folder not found - the saved sound still plays. Load the folder to explore again.";
+    }
+}
+
+//==============================================================================
+// Audio thread
+void LatentAudioVSTAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    hostSampleRate = sampleRate;
+
+    const juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) juce::jmax (1, samplesPerBlock), 1 };
+    for (auto* f : { &filterA, &filterB })
+    {
+        f->prepare (spec);
+        f->setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+        f->reset();
+    }
+
+    cutoffSmoothed.reset (sampleRate, 0.02);
+    cutoffSmoothed.setCurrentAndTargetValue (juce::jlimit (20.0f, (float) (0.45 * sampleRate), pCutoff->load()));
+    gainSmoothed.reset (sampleRate, 0.02);
+    gainSmoothed.setCurrentAndTargetValue (pGain->load() * pMix->load());
+
+    offlineServicedSeq = requestSeq.load() - 1; // force a decode on the first offline block
+}
+
+void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+{
+    juce::ScopedNoDenormals noDenormals;
+    const int numSamples = buffer.getNumSamples();
+    buffer.clear();
+
+    if (resetRequested.exchange (false))
+    {
+        activeAudio.clear();     // clear() keeps capacity: no deallocation here
+        incomingAudio.clear();
+        voice = {};
+        crossfading = false;
+        stealGain = 0.0f;
+        waitingNoteStart = false;
+        audioAvailable.store (false);
+        filterA.reset();
+        filterB.reset();
+    }
+
+    if (isNonRealtime())
+        renderOfflineInference();
+    else
+        takePendingAudio();
+
+    if (startRequested.exchange (false) && ! activeAudio.empty())
+        startVoice (-1, 1.0f);
+
+    // Turning Hold off lets a looping voice finish (unless a note still holds it).
+    const bool latch = pLatch->load() > 0.5f;
+    if (lastLatch && ! latch && voice.playing && voice.note < 0)
+        releaseVoice();
+    lastLatch = latch;
+
+    const double ratio = (double) modelSampleRate.load() / hostSampleRate;
+    const double tune = std::pow (2.0, (double) pTune->load() / 1200.0);
+    const double baseSpeed = (double) pRate->load() * tune * ratio;
+
+    // Render in segments between MIDI events for sample-accurate timing.
+    float* out = buffer.getWritePointer (0);
+    int pos = 0;
+    for (const auto meta : midi)
+    {
+        const int at = juce::jlimit (0, numSamples, meta.samplePosition);
+        renderVoice (out, pos, at, baseSpeed);
+        handleMidi (meta.getMessage());
+        pos = at;
+    }
+    renderVoice (out, pos, numSamples, baseSpeed);
+
+    // Filter + output level
+    const float nyquistSafe = (float) (0.45 * hostSampleRate);
+    cutoffSmoothed.setTargetValue (juce::jlimit (20.0f, nyquistSafe, pCutoff->load()));
+    gainSmoothed.setTargetValue (pGain->load() * pMix->load());
+    const float reso = juce::jlimit (0.0f, 1.0f, pReso->load());
+
+    // 4-pole: Butterworth pair at zero resonance; resonance only on the second stage.
+    filterA.setResonance (0.5412f);
+    filterB.setResonance (1.3066f + reso * 7.0f);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        if ((i & 7) == 0)
+        {
+            const float c = cutoffSmoothed.getNextValue();
+            filterA.setCutoffFrequency (c);
+            filterB.setCutoffFrequency (c);
+            cutoffSmoothed.skip (std::min (7, numSamples - i - 1));
+        }
+        const float y = filterB.processSample (0, filterA.processSample (0, out[i]));
+        out[i] = y * gainSmoothed.getNextValue();
+    }
+
+    for (int ch = 1; ch < buffer.getNumChannels(); ++ch)
+        buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
+
+    const int len = (int) activeAudio.size();
+    playheadNorm.store (voice.playing && len > 0 ? (float) (voice.pos / (double) len) : -1.0f);
+}
+
+void LatentAudioVSTAudioProcessor::takePendingAudio()
+{
+    if (! pendingReady.load (std::memory_order_acquire) || crossfading)
+        return; // never change content mid-fade; take it once the fade completes
+
+    const juce::SpinLock::ScopedTryLockType lock (pendingLock);
+    if (! lock.isLocked())
+        return; // inference thread is mid-publish; next block
+
+    if (pendingGeneration != modelGeneration.load() || pendingAudio.empty())
+    {
+        pendingReady.store (false);
+        return;
+    }
+
+    const bool audition = playOnArrival.exchange (false);
+
+    if (voice.playing && ! voice.released && ! activeAudio.empty())
+    {
+        std::swap (incomingAudio, pendingAudio);
+        crossfading = true;
+        crossfadePos = 0.0f;
+        crossfadeInc = (float) (1.0 / (kSwapFadeSeconds * hostSampleRate));
     }
     else
     {
-        state.setProperty("hasValidAudio", false, nullptr);
-        juce::Logger::writeToLog("[getStateInformation] No audio to save");
+        std::swap (activeAudio, pendingAudio);
+        if (waitingNoteStart)
+        {
+            waitingNoteStart = false;
+            startVoice (waitingNote, waitingVelocity);
+        }
+        else if (audition)
+        {
+            startVoice (-1, 1.0f);
+        }
     }
 
-    // Use JUCE's standard copyXmlToBinary directly - no custom framing!
-    std::unique_ptr<juce::XmlElement> xml(state.createXml());
-    copyXmlToBinary(*xml, destData);
-
-    juce::Logger::writeToLog("[getStateInformation] State saved successfully using standard JUCE format, total size: " + juce::String(destData.getSize()));
+    pendingReady.store (false);
+    audioAvailable.store (true);
 }
 
-void LatentAudioVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+void LatentAudioVSTAudioProcessor::renderOfflineInference()
 {
-    juce::Logger::writeToLog("[setStateInformation] === LOADING STATE ===");
-    juce::Logger::writeToLog("[setStateInformation] sizeInBytes: " + juce::String(sizeInBytes));
+    // Offline rendering may block: wait for a model that is still loading and
+    // decode synchronously so exports are deterministic.
+    if (loadInProgress.load())
+        waitForModelLoad (120000);
 
-    if (sizeInBytes < 4)
+    if (! decoder.isModelLoaded())
     {
-        juce::Logger::writeToLog("[setStateInformation] Data too small, aborting");
+        takePendingAudio(); // e.g. restored audio without a model
         return;
     }
 
-    // Use JUCE's standard getXmlFromBinary directly on the raw DAW data
-    std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+    const auto seq = requestSeq.load();
+    if (seq == offlineServicedSeq && ! activeAudio.empty())
+        return;
+    offlineServicedSeq = seq;
 
-    if (xmlState == nullptr)
+    std::vector<float> audio;
+    if (! decodeAt (currentX.load(), currentY.load(), audio))
+        return;
+
     {
-        juce::Logger::writeToLog("[setStateInformation] XML parse failed");
+        const juce::ScopedLock sl (displayLock);
+        displayWaveform = audio;
+    }
+    displayVersion.fetch_add (1);
+
+    if (crossfading)
+        finishCrossfade();
+    std::swap (activeAudio, audio);   // hard swap: matches realtime timing best offline
+    audioAvailable.store (true);
+
+    const bool audition = playOnArrival.exchange (false);
+    if (waitingNoteStart)
+    {
+        waitingNoteStart = false;
+        startVoice (waitingNote, waitingVelocity);
+    }
+    else if (audition && ! (voice.playing && ! voice.released))
+    {
+        startVoice (-1, 1.0f);
+    }
+}
+
+void LatentAudioVSTAudioProcessor::handleMidi (const juce::MidiMessage& m)
+{
+    if (m.isNoteOn())
+    {
+        midiActivityCount.fetch_add (1);
+        if (pTriggerOnMidi->load() < 0.5f)
+            return;
+
+        if (activeAudio.empty())
+        {
+            // No sound yet: start as soon as one arrives.
+            waitingNoteStart = true;
+            waitingNote = m.getNoteNumber();
+            waitingVelocity = m.getFloatVelocity();
+            if (decoder.isModelLoaded())
+                requestInference (false);
+            return;
+        }
+        startVoice (m.getNoteNumber(), m.getFloatVelocity());
+    }
+    else if (m.isNoteOff())
+    {
+        midiActivityCount.fetch_add (1);
+        if (pTriggerOnMidi->load() < 0.5f)
+            return;
+
+        if (waitingNoteStart && m.getNoteNumber() == waitingNote)
+            waitingNoteStart = false;
+
+        // Only the note that is sounding may release it (overlapping legato notes).
+        if (voice.playing && m.getNoteNumber() == voice.note)
+        {
+            voice.note = -1;
+            if (pLatch->load() < 0.5f)
+                releaseVoice();
+        }
+    }
+    else if (m.isAllNotesOff() || m.isAllSoundOff())
+    {
+        waitingNoteStart = false;
+        voice.note = -1;
+        releaseVoice();
+    }
+}
+
+void LatentAudioVSTAudioProcessor::startVoice (int note, float velocity)
+{
+    const int len = (int) activeAudio.size();
+    if (len < 4)
+        return;
+
+    // Declick: let the old read head fade out briefly instead of jumping.
+    if (voice.playing && voice.envLevel * voice.velocityGain > 1.0e-4f)
+    {
+        stealPos = voice.pos;
+        stealSpeed = (double) pRate->load() * voice.noteRatio * (double) modelSampleRate.load() / hostSampleRate;
+        stealGain = voice.envLevel * voice.velocityGain;
+        stealInc = stealGain / (float) (kStealFadeSeconds * hostSampleRate);
+    }
+
+    const float sens = juce::jlimit (0.0f, 1.0f, pVelocity->load());
+    const bool keyTrack = pKeyTrack->load() > 0.5f && note >= 0;
+
+    voice.playing = true;
+    voice.released = false;
+    voice.envLevel = 0.0f;
+    voice.pos = juce::jlimit (0.0f, 0.9f, pStart->load()) * (double) len;
+    voice.note = note;
+    voice.velocityGain = 1.0f - sens + sens * juce::jlimit (0.0f, 1.0f, velocity);
+    voice.noteRatio = keyTrack ? std::pow (2.0, (note - (double) pRootNote->load()) / 12.0) : 1.0;
+}
+
+void LatentAudioVSTAudioProcessor::releaseVoice()
+{
+    if (voice.playing)
+        voice.released = true;
+}
+
+void LatentAudioVSTAudioProcessor::finishCrossfade()
+{
+    std::swap (activeAudio, incomingAudio);
+    crossfading = false;
+    crossfadePos = 0.0f;
+}
+
+void LatentAudioVSTAudioProcessor::renderVoice (float* out, int startSample, int endSample, double baseSpeed)
+{
+    if (startSample >= endSample || (! voice.playing && stealGain <= 0.0f))
+        return;
+
+    const bool latch = pLatch->load() > 0.5f;
+    const double startFrac = juce::jlimit (0.0f, 0.9f, pStart->load());
+    const double endFrac = juce::jlimit (0.1f, 1.0f, pEnd->load());
+    const double seamFrac = juce::jlimit (0.0f, 0.5f, pLoopXfade->load());
+    const float attackInc = (float) (1.0 / (kAttackSeconds * hostSampleRate));
+    const float releaseDec = (float) (1.0 / (kReleaseSeconds * hostSampleRate));
+
+    const float* data = nullptr;
+    int len = 0;
+    double loopStart = 0.0, loopEnd = 0.0;
+    auto refresh = [&]
+    {
+        data = activeAudio.data();
+        len = (int) activeAudio.size();
+        const double minLen = std::max (64.0, 0.01 * len);
+        loopStart = startFrac * len;
+        loopEnd = std::min ((double) len, std::max (endFrac * len, loopStart + minLen));
+        loopStart = std::max (0.0, std::min (loopStart, loopEnd - minLen));
+    };
+    refresh();
+
+    if (len < 4)
+    {
+        voice.playing = false;
+        stealGain = 0.0f;
         return;
     }
 
-    juce::Logger::writeToLog("[setStateInformation] XML parsed successfully using standard JUCE format");
-
-    if (xmlState->hasTagName(parameters->state.getType()))
+    for (int i = startSample; i < endSample; ++i)
     {
-        auto state = juce::ValueTree::fromXml(*xmlState);
+        float sample = 0.0f;
 
-        // Restore APVTS state (this updates all parameters)
-        parameters->replaceState(state);
-
-        // Restore custom data
-        bool shouldLoadModel = false;
-
-        if (state.hasProperty("modelPath"))
+        if (voice.playing)
         {
-            juce::String pathStr = state.getProperty("modelPath").toString();
-            juce::Logger::writeToLog("[setStateInformation] Restored modelPath: " + pathStr);
+            const double speed = baseSpeed * voice.noteRatio;
+            float sig = 0.0f;
 
-            if (pathStr.isNotEmpty())
+            if (voice.pos >= loopEnd)
             {
-                juce::File loadedModelPath(pathStr);
-                if (loadedModelPath.existsAsFile())
-                {
-                    modelPath = loadedModelPath;
-                    shouldLoadModel = true;
-                    juce::Logger::writeToLog("[setStateInformation] Model file exists, will load");
-                }
+                if (latch)
+                    voice.pos = loopStart + std::fmod (voice.pos - loopStart, loopEnd - loopStart);
                 else
-                {
-                    juce::Logger::writeToLog("[setStateInformation] WARNING: Model file does not exist!");
-                }
+                    voice.released = true; // one-shot reached its end
             }
-        }
 
-        if (state.hasProperty("soundMapPath"))
-        {
-            juce::String pathStr = state.getProperty("soundMapPath").toString();
-            juce::Logger::writeToLog("[setStateInformation] Restored soundMapPath: " + pathStr);
-
-            if (pathStr.isNotEmpty())
+            if (voice.pos < loopEnd)
             {
-                juce::File loadedSoundMapPath(pathStr);
-                if (loadedSoundMapPath.existsAsFile())
+                sig = readHermite (data, len, voice.pos);
+
+                // Loop seam: blend the loop start into the end so the wrap is seamless.
+                if (latch && seamFrac > 0.001)
                 {
-                    soundMapPath = loadedSoundMapPath;
-                    shouldLoadModel = true;
-                    juce::Logger::writeToLog("[setStateInformation] Sound map file exists, will load");
-                }
-                else
-                {
-                    juce::Logger::writeToLog("[setStateInformation] WARNING: Sound map file does not exist!");
-                }
-            }
-        }
-
-        // Restore cursor position
-        float restoredX = 0.0f;
-        float restoredY = 0.0f;
-
-        if (state.hasProperty("currentX"))
-        {
-            restoredX = state.getProperty("currentX");
-            currentX.store(restoredX);
-            juce::Logger::writeToLog("[setStateInformation] Restored currentX: " + juce::String(restoredX));
-        }
-
-        if (state.hasProperty("currentY"))
-        {
-            restoredY = state.getProperty("currentY");
-            currentY.store(restoredY);
-            juce::Logger::writeToLog("[setStateInformation] Restored currentY: " + juce::String(restoredY));
-        }
-
-        // Load model/map files if paths were found
-        juce::Logger::writeToLog("[setStateInformation] shouldLoadModel: " + juce::String(shouldLoadModel ? "true" : "false"));
-        if (shouldLoadModel)
-        {
-            juce::Logger::writeToLog("[setStateInformation] Loading model and map...");
-            loadModelAndMap();
-        }
-        else if (soundMap.getLatentDim() > 0)
-        {
-            // Sync position parameters even if not loading model (model already loaded)
-            float minX = soundMap.getMinX();
-            float maxX = soundMap.getMaxX();
-            float minY = soundMap.getMinY();
-            float maxY = soundMap.getMaxY();
-
-            float rangeX = maxX - minX;
-            float rangeY = maxY - minY;
-
-            if (rangeX > 0.0001f && rangeY > 0.0001f)
-            {
-                float normalizedX = juce::jlimit(0.0f, 1.0f, (restoredX - minX) / rangeX);
-                float normalizedY = juce::jlimit(0.0f, 1.0f, (maxY - restoredY) / rangeY);
-
-                parameters->getParameter("positionX")->setValue(normalizedX);
-                parameters->getParameter("positionY")->setValue(normalizedY);
-            }
-        }
-
-        // Restore audio data from Base64 properties
-        bool hasAudio = state.getProperty("hasValidAudio", false);
-        juce::Logger::writeToLog("[setStateInformation] hasValidAudio property: " + juce::String(hasAudio ? "true" : "false"));
-
-        if (hasAudio)
-        {
-            int activeIdx = state.getProperty("activeBufferIndex", 0);
-            activeBufferIndex.store(activeIdx);
-
-            int playPos = state.getProperty("playbackPosition", -1);
-            playbackPosition.store(playPos);
-            fractionalPosition = (float)playPos;
-
-            int envInt = state.getProperty("envState", 0);
-            envState = static_cast<EnvelopeState>(envInt);
-
-            juce::ScopedLock sl(bufferLock);
-            for (int bufIdx = 0; bufIdx < 2; ++bufIdx)
-            {
-                int numChannels = state.getProperty("buffer" + juce::String(bufIdx) + "_channels", 0);
-                int numSamples = state.getProperty("buffer" + juce::String(bufIdx) + "_samples", 0);
-
-                juce::Logger::writeToLog("[setStateInformation] Buffer " + juce::String(bufIdx) +
-                    ": channels=" + juce::String(numChannels) + ", samples=" + juce::String(numSamples));
-
-                if (numChannels > 0 && numSamples > 0)
-                {
-                    soundBuffers[bufIdx].setSize(numChannels, numSamples, false, false, false);
-
-                    for (int ch = 0; ch < numChannels; ++ch)
+                    const double seam = (loopEnd - loopStart) * seamFrac;
+                    const double toEnd = loopEnd - voice.pos;
+                    if (toEnd < seam)
                     {
-                        juce::String base64 = state.getProperty("buffer" + juce::String(bufIdx) + "_ch" + juce::String(ch), "").toString();
-                        if (base64.isNotEmpty())
-                        {
-                            juce::MemoryBlock audioBlock;
-                            if (audioBlock.fromBase64Encoding(base64))
-                            {
-                                float* writePtr = soundBuffers[bufIdx].getWritePointer(ch);
-                                std::memcpy(writePtr, audioBlock.getData(), sizeof(float) * numSamples);
-                            }
-                        }
+                        const float w = (float) ((seam - toEnd) / seam);
+                        sig = sig * (1.0f - w) + readHermite (data, len, loopStart + (seam - toEnd)) * w;
                     }
                 }
-                else
+
+                if (crossfading)
                 {
-                    soundBuffers[bufIdx].setSize(2, 0, false, false, false);
+                    const int inLen = (int) incomingAudio.size();
+                    const float next = inLen > 3 ? readHermite (incomingAudio.data(), inLen, voice.pos) : 0.0f;
+                    sig = sig * (1.0f - crossfadePos) + next * crossfadePos;
+                    crossfadePos += crossfadeInc;
+                    if (crossfadePos >= 1.0f)
+                    {
+                        finishCrossfade();
+                        refresh();
+                        if (len < 4) { voice.playing = false; break; }
+                    }
                 }
             }
 
-            hasValidAudio.store(true);
-            juce::Logger::writeToLog("[setStateInformation] Audio data decoded from Base64, active buffer: " + juce::String(activeIdx));
-        }
-        else
-        {
-            hasValidAudio.store(false);
-            juce::Logger::writeToLog("[setStateInformation] No audio data to load");
-        }
-
-        // Update UI on message thread
-        juce::MessageManager::callAsync([this, restoredX, restoredY]() {
-            if (auto* editor = dynamic_cast<LatentAudioVSTAudioProcessorEditor*>(getActiveEditor()))
+            if (voice.released)
             {
-                juce::Logger::writeToLog("[setStateInformation] Updating UI from processor");
-                editor->updateUIFromProcessor();
-
-                // CRITICAL: Update nebula cursor position
-                juce::Logger::writeToLog("[setStateInformation] Setting nebula cursor to (" + juce::String(restoredX) + ", " + juce::String(restoredY) + ")");
-                editor->nebulaComp.setCursorPosition(restoredX, restoredY);
+                voice.envLevel -= releaseDec;
+                if (voice.envLevel <= 0.0f)
+                {
+                    voice.envLevel = 0.0f;
+                    voice.playing = false;
+                    if (crossfading)
+                    {
+                        finishCrossfade();
+                        refresh();
+                    }
+                }
             }
-        });
-
-        juce::Logger::writeToLog("[setStateInformation] === STATE LOADED ===");
-    }
-}
-
-//==============================================================================
-//==============================================================================
-// FIX #3: UPDATE applyPostProcessing with filter protection
-void LatentAudioVSTAudioProcessor::applyPostProcessing(std::vector<float>& audio)
-{
-    if (audio.empty()) return;
-
-    // LP filter is applied live in processBlock, not pre-baked here.
-    // This ensures realtime playback and offline export use identical filter state.
-    const float threshold = std::pow(10.0f, -60.0f / 20.0f);
-    int lastHotIndex = -1;
-    int n = (int)audio.size();
-
-    for (int i = 0; i < n; ++i)
-    {
-        if (std::abs(audio[i]) > threshold)
-            lastHotIndex = i;
-    }
-
-    if (lastHotIndex >= 0)
-    {
-        if (lastHotIndex < n - 882)
-        {
-            int fadeStart = lastHotIndex + 10;
-            int fadeLen = 512;
-            int fadeEnd = std::min(fadeStart + fadeLen, n);
-
-            if (fadeStart < n)
+            else if (voice.envLevel < 1.0f)
             {
-                for (int i = fadeStart; i < fadeEnd; ++i)
-                {
-                    float alpha = 1.0f - (float)(i - fadeStart) / (float)fadeLen;
-                    audio[i] *= alpha;
-                }
-                if (fadeEnd < n)
-                {
-                    std::fill(audio.begin() + fadeEnd, audio.end(), 0.0f);
-                }
+                voice.envLevel = std::min (1.0f, voice.envLevel + attackInc);
             }
+
+            sample = sig * voice.envLevel * voice.velocityGain;
+            voice.pos += speed;
         }
-    }
-    else
-    {
-        std::fill(audio.begin(), audio.end(), 0.0f);
-    }
 
-    if (n > 4 && audio[n - 1] != 0.0f)
-    {
-        audio[n - 4] *= 0.75f;
-        audio[n - 3] *= 0.50f;
-        audio[n - 2] *= 0.25f;
-        audio[n - 1] *= 0.00f;
-    }
-
-    float maxAmp = 0.0f;
-    for (float s : audio) maxAmp = std::max(maxAmp, std::abs(s));
-
-    if (maxAmp > 1.0f)
-    {
-        float scale = 1.0f / maxAmp;
-        for (float& s : audio) s *= scale;
-    }
-}
-
-//==============================================================================
-void LatentAudioVSTAudioProcessor::setModelPath(const juce::File& path)
-{
-    modelPath = path;
-}
-
-void LatentAudioVSTAudioProcessor::setSoundMapPath(const juce::File& path)
-{
-    soundMapPath = path;
-}
-
-void LatentAudioVSTAudioProcessor::loadModelAndMap()
-{
-    juce::Logger::writeToLog("[loadModelAndMap] === START ===");
-    juce::Logger::writeToLog("[loadModelAndMap] soundMapPath: " + soundMapPath.getFullPathName());
-    juce::Logger::writeToLog("[loadModelAndMap] modelPath: " + modelPath.getFullPathName());
-
-    if (soundMapPath.existsAsFile())
-    {
-        juce::Logger::writeToLog("[loadModelAndMap] Loading sound map...");
-        if (soundMap.loadFromFile(soundMapPath))
+        if (stealGain > 0.0f)
         {
-            // Sync latent dimension to decoder
-            decoder.setLatentDim(soundMap.getLatentDim());
-            juce::Logger::writeToLog("[loadModelAndMap] SoundMap loaded, latentDim=" + juce::String(soundMap.getLatentDim()) + ", points=" + juce::String(soundMap.getPoints().size()));
-
-            // Initialize parameter throttling positions to current position
-            lastParamX = currentX.load();
-            lastParamY = currentY.load();
-
-            // Sync position parameters with current crosshair position (now that bounds are available)
-            float minX = soundMap.getMinX();
-            float maxX = soundMap.getMaxX();
-            float minY = soundMap.getMinY();
-            float maxY = soundMap.getMaxY();
-
-            // Convert current position to normalized coordinates for parameters
-            float normalizedX = juce::jlimit(0.0f, 1.0f, (currentX.load() - minX) / (maxX - minX));
-            float normalizedY = juce::jlimit(0.0f, 1.0f, (currentY.load() - minY) / (maxY - minY));
-
-            // Update APVTS parameters (silently to avoid callbacks during load)
-            parameters->getParameter("positionX")->setValue(normalizedX);
-            parameters->getParameter("positionY")->setValue(normalizedY);
-
-            juce::Logger::writeToLog("[loadModelAndMap] Synced position parameters with crosshair: X=" + juce::String(normalizedX) + ", Y=" + juce::String(normalizedY));
-        }
-        else
-        {
-            juce::Logger::writeToLog("[loadModelAndMap] SoundMap failed to load!");
-        }
-    }
-    else
-    {
-        juce::Logger::writeToLog("[loadModelAndMap] soundMapPath does not exist!");
-    }
-
-    if (modelPath.existsAsFile())
-    {
-        juce::Logger::writeToLog("[loadModelAndMap] Loading model...");
-        bool modelResult = decoder.loadModel(modelPath);
-        juce::Logger::writeToLog("[loadModelAndMap] decoder.loadModel() returned: " + juce::String(modelResult ? "TRUE" : "FALSE"));
-        juce::Logger::writeToLog("[loadModelAndMap] decoder.isModelLoaded() = " + juce::String(decoder.isModelLoaded() ? "TRUE" : "FALSE"));
-    }
-    else
-    {
-        juce::Logger::writeToLog("[loadModelAndMap] modelPath does not exist!");
-    }
-
-    juce::Logger::writeToLog("[loadModelAndMap] === END ===");
-}
-
-//==============================================================================
-// FIX #4: UPDATE loadModelFolder to completely reset audio state
-bool LatentAudioVSTAudioProcessor::loadModelFolder(const juce::File& folder)
-{
-    juce::Logger::writeToLog("[loadModelFolder] === START ===");
-
-    if (!folder.isDirectory())
-        return false;
-
-    juce::Array<juce::File> modelFiles, jsonFiles;
-    folder.findChildFiles(modelFiles, juce::File::findFiles, false, "*.onnx");
-    folder.findChildFiles(jsonFiles, juce::File::findFiles, false, "*.json");
-
-    // Signal that a switch is in progress.  Any onInferenceFinished callback
-    // that fires while this flag is true will discard its result immediately,
-    // so we don't need a sleep() to wait for the inference thread to drain.
-    modelSwitchPending.store(true);
-
-    // Stop playback and mark audio invalid *before* touching anything else.
-    hasValidAudio.store(false);
-    playbackPosition.store(-1);
-    envState = EnvelopeState::Idle;
-    currentEnvLevel = 0.0f;
-    fractionalPosition = 0.0f;
-    isCrossfading = false;
-    triggerCrossfade.store(false);
-
-    bool success = false;
-
-    // Load sound map
-    if (jsonFiles.size() > 0)
-    {
-        soundMapPath = jsonFiles[0];
-        if (soundMap.loadFromFile(soundMapPath))
-        {
-            decoder.setLatentDim(soundMap.getLatentDim());
-
-            lastParamX = currentX.load();
-            lastParamY = currentY.load();
-
-            float minX = soundMap.getMinX();
-            float maxX = soundMap.getMaxX();
-            float minY = soundMap.getMinY();
-            float maxY = soundMap.getMaxY();
-
-            float normalizedX = juce::jlimit(0.0f, 1.0f, (currentX.load() - minX) / (maxX - minX));
-            float normalizedY = juce::jlimit(0.0f, 1.0f, (currentY.load() - minY) / (maxY - minY));
-
-            parameters->getParameter("positionX")->setValue(normalizedX);
-            parameters->getParameter("positionY")->setValue(normalizedY);
-
-            success = true;
-        }
-    }
-
-    // Load model
-    if (modelFiles.size() > 0)
-    {
-        modelPath = modelFiles[0];
-        if (decoder.loadModel(modelPath))
-            success = true;
-    }
-
-    // CRITICAL: Reset EVERYTHING
-    if (success)
-    {
-        // Clear buffers
-        {
-            juce::ScopedLock sl(bufferLock);
-            soundBuffers[0].setSize(2, 0, false, false, false);
-            soundBuffers[1].setSize(2, 0, false, false, false);
-            soundBuffers[0].clear();
-            soundBuffers[1].clear();
-            activeBufferIndex.store(0);
+            if (stealPos < (double) len)
+                sample += readHermite (data, len, stealPos) * stealGain;
+            stealPos += stealSpeed;
+            stealGain = std::max (0.0f, stealGain - stealInc);
         }
 
-        // Re-assert the full playback reset AFTER clearing buffers.
-        // This wins any race where onInferenceFinished managed to write
-        // hasValidAudio=true / playbackPosition=0 before the buffer clear
-        // (i.e. it beat the modelSwitchPending guard on a very tight race).
-        hasValidAudio.store(false);
-        playbackPosition.store(-1);
-        envState = EnvelopeState::Idle;
-        currentEnvLevel = 0.0f;
-        fractionalPosition = 0.0f;
-        isCrossfading = false;
-        triggerCrossfade.store(false);
+        out[i] += sample;
 
-        // Reset filters
-        {
-            const juce::ScopedLock sl(filterLock);
-            lpFilter1.reset();
-            lpFilter2.reset();
-            lastCutoff = -1.0f;
-            lastReso = -1.0f;
-        }
-
-        lastGeneratedWaveform.clear();
-        newWaveformAvailable.store(false);
-
-        // Allow onInferenceFinished to process results from the new model again,
-        // and trigger auto-generation on the next processBlock.
-        modelSwitchPending.store(false);
-        isFirstProcess.store(true);
-
-        juce::Logger::writeToLog("[loadModelFolder] Complete reset performed");
+        if (! voice.playing && stealGain <= 0.0f)
+            break;
     }
-    else
-    {
-        // Load failed — clear the flag so inference still works if the old model is intact.
-        modelSwitchPending.store(false);
-    }
-
-    juce::Logger::writeToLog("[loadModelFolder] === END: " + juce::String(success ? "SUCCESS" : "FAILED") + " ===");
-    return success;
-}
-
-//==============================================================================
-// Manual unload functionality
-//==============================================================================
-
-bool LatentAudioVSTAudioProcessor::unloadModel(const juce::String& modelPath)
-{
-    juce::Logger::writeToLog("[unloadModel] Attempting to unload: " + modelPath);
-
-    // Check if this is the currently loaded model
-    juce::String currentModelPath = this->modelPath.getFullPathName();
-    if (currentModelPath == modelPath)
-    {
-        juce::Logger::writeToLog("[unloadModel] WARNING: Attempting to unload currently active model - clearing local state");
-
-        // Clear local state but don't unload from cache yet
-        // The cache entry will remain for other instances
-        playbackPosition.store(-1);
-        envState = EnvelopeState::Idle;
-        currentEnvLevel = 0.0f;
-        fractionalPosition = 0.0f;
-        hasValidAudio.store(false);
-
-        // Clear buffers
-        {
-            juce::ScopedLock sl(bufferLock);
-            soundBuffers[0].setSize(2, 0, false, false, false);
-            soundBuffers[1].setSize(2, 0, false, false, false);
-            soundBuffers[0].clear();
-            soundBuffers[1].clear();
-        }
-
-        // Reset filters
-        {
-            const juce::ScopedLock sl(filterLock);
-            lpFilter1.reset();
-            lpFilter2.reset();
-            lastCutoff = -1.0f;
-            lastReso = -1.0f;
-        }
-
-        lastGeneratedWaveform.clear();
-        newWaveformAvailable.store(false);
-
-        juce::Logger::writeToLog("[unloadModel] Cleared local state for active model");
-    }
-
-    // Always attempt to unload from shared cache
-    bool cacheResult = LatentDecoder::unloadModelFromCache(modelPath);
-
-    if (cacheResult)
-    {
-        juce::Logger::writeToLog("[unloadModel] Successfully unloaded from cache: " + modelPath);
-    }
-    else
-    {
-        juce::Logger::writeToLog("[unloadModel] Model not found in cache or unload failed: " + modelPath);
-    }
-
-    return cacheResult;
 }
 
 //==============================================================================

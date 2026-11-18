@@ -21,33 +21,26 @@
 #include <vector>
 
 //==============================================================================
+// Min/max peak view of the generated sound with the start/end region and playhead.
 class WaveformComponent : public juce::Component
 {
 public:
-    WaveformComponent();
-    ~WaveformComponent() override;
+    WaveformComponent() = default;
+
+    void setWaveform (std::vector<float> audioData);
+    void setPlaybackPosition (float normalizedPosition); // < 0 hides the playhead
+    void setRegion (float normalizedStart, float normalizedEnd);
 
     void paint (juce::Graphics&) override;
-    void resized() override;
-
-    // Updates the waveform data to be displayed
-    void setWaveform (const std::vector<float>& audioData);
-
-    // Sets the playback progress (0.0 to 1.0)
-    void setPlaybackPosition (float normalizedPosition);
-    
-    // Sets the loop endpoint (0.0 to 1.0)
-    void setLoopLength (float normalizedLength); // 0.1 to 1.0 based on sample length
-    void setSampleStart (float normalizedStart); // 0.0 to 0.9 based on sample start
-    void setFades (float normalizedIn, float normalizedOut);
+    void resized() override { peaks.clear(); }
 
 private:
+    void computePeaks (int width);
+
     std::vector<float> waveform;
+    std::vector<std::pair<float, float>> peaks; // per pixel column, cached
     float playbackPos = -1.0f;
-    float loopLen = 1.0f;
-    float startPos = 0.0f;
-    float fadeIn = 0.0f;
-    float fadeOut = 0.0f;
+    float regionStart = 0.0f, regionEnd = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformComponent)
 };

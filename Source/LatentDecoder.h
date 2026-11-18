@@ -18,75 +18,84 @@
 #pragma once
 
 #include <JuceHeader.h>
-#include <vector>
-#include <memory>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
-// ONNX Runtime Headers
-// Suppress warnings from external headers
+// ONNX Runtime headers (silence conversion warnings from external code)
 #pragma warning(push)
-#pragma warning(disable: 4267) // Conversion warning
+#pragma warning(disable: 4267)
 #pragma warning(disable: 4244)
 #include <onnxruntime_cxx_api.h>
 #pragma warning(pop)
 
 //==============================================================================
+// Wraps one ONNX decoder session: latent vector -> mono audio.
+//
+// Thread safety: every public method may be called from any thread except the
+// audio thread (decode() runs the network and allocates). Loading a new model
+// swaps an immutable handle under a short lock, so a decode() already in flight
+// keeps using the old session until it finishes - nothing is freed under it.
+//
+// Sessions are cached per model file and shared between plugin instances via
+// weak references, so the (large) model is freed once no instance uses it.
 class LatentDecoder
 {
 public:
-    static std::map<std::string, std::shared_ptr<Ort::Session>> sharedSessions;
-    static std::map<std::string, std::string> sharedProviders; // path -> "CPU" / "GPU: CUDA" / "GPU: DML"
-    static std::shared_ptr<Ort::Env> sharedEnv;
-    static std::mutex sharedMutex;
-    static std::atomic<int> instanceCount;
-    static void incrementInstances() { instanceCount.fetch_add(1); }
-    static void decrementInstances() { instanceCount.fetch_sub(1); }
-    static int getInstanceCount() { return instanceCount.load(); }
-    LatentDecoder();
-    ~LatentDecoder();
+    LatentDecoder() = default;
+    ~LatentDecoder() = default;
 
-    bool loadModel (const juce::File& modelFile);
+    struct LoadResult
+    {
+        bool ok = false;
+        juce::String error;
+    };
 
-    // Run inference: 128D input -> Audio output
-    // Returns true on success
-    bool decode (const std::vector<float>& latentVector, std::vector<float>& audioOutput);
+    // If expectedLatentDim > 0 and the model's input size differs, nothing is
+    // swapped and an error is returned (the current model stays active).
+    LoadResult loadModel (const juce::File& modelFile, int expectedLatentDim = -1);
+    void unload();
 
-    void setLatentDim(int dim) { latentDim = dim; }
+    // Returns false (and leaves audioOutput untouched) on failure.
+    bool decode (const std::vector<float>& latentVector, std::vector<float>& audioOutput) const;
 
-    bool isModelLoaded() const { return session != nullptr; }
+    bool isModelLoaded() const { return getHandle() != nullptr; }
 
-    int getExpectedLatentDim() const { return latentDim; }
+    // "None", "CPU", "GPU: CUDA" or "GPU: DML"
+    juce::String getActiveProvider() const;
 
-    // Returns which execution provider the active session was created with.
-    // "None" = no model loaded, "CPU", "GPU: CUDA", "GPU: DML"
-    juce::String getActiveProvider() const { return activeProvider; }
+    // Latent size the model expects, or -1 if unknown / dynamic / not loaded.
+    int getModelLatentDim() const;
 
-    // Manual unload functionality
-    static bool unloadModelFromCache(const juce::String& modelPath);
-    static std::vector<juce::String> getLoadedModels();
+    juce::File getModelFile() const;
+
+    // Number of distinct model files currently resident (across all instances).
     static int getCacheSize();
 
 private:
-    std::shared_ptr<Ort::Env> env;
-    std::shared_ptr<Ort::Session> session;
+    struct Handle
+    {
+        std::shared_ptr<Ort::Env> env; // keeps the Env alive for as long as the session
+        std::unique_ptr<Ort::Session> session;
+        std::vector<std::string> inputNames, outputNames;
+        std::vector<const char*> inputNamePtrs, outputNamePtrs;
+        std::string provider;
+        int64_t latentDim = -1;
+        juce::File file;
+    };
 
-    // Which execution provider this instance's session was created with
-    juce::String activeProvider { "None" };
+    std::shared_ptr<const Handle> getHandle() const;
+    static std::shared_ptr<const Handle> createHandle (const juce::File& file, juce::String& error);
 
-    // Model Info
-    int latentDim = 128;
-    
-    // Use unique_ptr for these to avoid header dependency issues if possible, 
-    // but Ort classes are small handles.
-    // We need to store input/output names for the Run call.
-    std::vector<const char*> inputNodeNames;
-    std::vector<const char*> outputNodeNames;
-    
-    // We also need to keep the strings alive if we used `GetInputNameAllocated`
-    std::vector<std::string> inputNodeNameStrings;
-    std::vector<std::string> outputNodeNameStrings;
+    mutable std::mutex handleMutex;
+    std::shared_ptr<const Handle> handle;
+
+    static std::mutex cacheMutex;
+    static std::map<std::string, std::weak_ptr<const Handle>> cache;
+    static std::weak_ptr<Ort::Env> sharedEnv;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LatentDecoder)
 };

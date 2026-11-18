@@ -18,6 +18,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <memory>
 #include <vector>
 
 //==============================================================================
@@ -25,44 +26,54 @@ struct SoundPoint
 {
     float x = 0.0f;
     float y = 0.0f;
+    juce::String label;
     std::vector<float> latent;
 };
 
 //==============================================================================
-class SoundMap
+// Immutable once built. Shared between threads via std::shared_ptr<const ...>.
+struct SoundMapData
 {
-public:
-    SoundMap();
-    ~SoundMap();
-
-    // Loads points from the JSON file
-    bool loadFromFile (const juce::File& file);
-
-    // Calculates the interpolated 128D latent vector for a given 2D position
-    // using Inverse Distance Weighting (IDW)
-    std::vector<float> getInterpolatedVector (float x, float y, int kNearest = 5) const;
-
-    // Find the nearest point to the given coordinates
-    const SoundPoint* getNearestPoint (float x, float y) const;
-
-    // Accessors
-    const std::vector<SoundPoint>& getPoints() const { return points; }
-    int getLatentDim() const { return latentDim; }
-    int getSampleRate() const { return sampleRate; }
-
-    // Bounds for normalization
-    float getMinX() const { return minX; }
-    float getMaxX() const { return maxX; }
-    float getMinY() const { return minY; }
-    float getMaxY() const { return maxY; }
-
-private:
     std::vector<SoundPoint> points;
-    int latentDim = 128;
+    int latentDim = 0;
     int sampleRate = 44100;
-
     float minX = 0.0f, maxX = 0.0f;
     float minY = 0.0f, maxY = 0.0f;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundMap)
+    float rangeX() const { return maxX - minX > 1.0e-6f ? maxX - minX : 1.0f; }
+    float rangeY() const { return maxY - minY > 1.0e-6f ? maxY - minY : 1.0f; }
+
+    // Inverse-distance-weighted blend of the kNearest points' latents.
+    std::vector<float> interpolate (float x, float y, int kNearest = 5) const;
+
+    // Indices of the kNearest points, closest first.
+    std::vector<int> nearestIndices (float x, float y, int kNearest) const;
+
+    // Index of the closest point, or -1 if the map is empty.
+    int nearestIndex (float x, float y) const;
+
+    // Parses and validates a sound_map.json. Returns nullptr and fills `error` on failure.
+    static std::shared_ptr<const SoundMapData> parse (const juce::String& json, juce::String& error);
+    static std::shared_ptr<const SoundMapData> load (const juce::File& file, juce::String& error);
+};
+
+//==============================================================================
+// Thread-safe holder of the current map. Readers take a snapshot; loading builds
+// a new SoundMapData and swaps it in, so readers never see a half-loaded map.
+// The swap uses a SpinLock that is held only for a pointer copy.
+class SoundMap
+{
+public:
+    std::shared_ptr<const SoundMapData> snapshot() const;
+    void setData (std::shared_ptr<const SoundMapData> newData);
+    void clear() { setData (nullptr); }
+
+    // Convenience: parse + swap. On failure the current map is left untouched.
+    bool loadFromFile (const juce::File& file, juce::String* error = nullptr);
+
+    bool isLoaded() const { auto d = snapshot(); return d != nullptr && ! d->points.empty(); }
+
+private:
+    mutable juce::SpinLock lock;
+    std::shared_ptr<const SoundMapData> data;
 };

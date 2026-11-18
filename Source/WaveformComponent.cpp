@@ -16,139 +16,117 @@
 */
 
 #include "WaveformComponent.h"
+#include "LatentLookAndFeel.h"
 
-//==============================================================================
-WaveformComponent::WaveformComponent()
+void WaveformComponent::setWaveform (std::vector<float> audioData)
 {
-}
-
-WaveformComponent::~WaveformComponent()
-{
-}
-
-void WaveformComponent::paint(juce::Graphics& g)
-{
-    auto w       = (float)getWidth();
-    auto h       = (float)getHeight();
-    auto bounds  = getLocalBounds().toFloat();
-    auto centerY = h * 0.5f;
-    auto scaleY  = h * 0.45f;
-
-    // Background
-    g.setColour(juce::Colour(0xff0d0d1a));
-    g.fillRect(bounds);
-
-    // Centre line
-    g.setColour(juce::Colour(0xff1a1a30));
-    g.drawLine(0.0f, centerY, w, centerY, 0.5f);
-
-    // Border
-    g.setColour(juce::Colour(0xff2a2a4a));
-    g.drawRect(bounds, 1.0f);
-
-    if (waveform.empty())
-    {
-        g.setColour(juce::Colour(0xff333355));
-        g.setFont(juce::Font(11.0f));
-        g.drawFittedText("No waveform", getLocalBounds(), juce::Justification::centred, 1);
-        return;
-    }
-
-    int step = 1;
-    if (waveform.size() > (size_t)w)
-        step = (int)(waveform.size() / w);
-
-    // Build paths
-    juce::Path strokePath, fillPath;
-    fillPath.startNewSubPath(0.0f, centerY);
-    strokePath.startNewSubPath(0.0f, centerY);
-
-    for (size_t i = 0; i < waveform.size(); i += step)
-    {
-        float x = (float)i / (float)waveform.size() * w;
-        float y = centerY - (waveform[i] * scaleY);
-        fillPath.lineTo(x, y);
-        strokePath.lineTo(x, y);
-    }
-    fillPath.lineTo(w, centerY);
-    fillPath.closeSubPath();
-
-    // Gradient fill
-    juce::ColourGradient waveGrad(juce::Colour(0x5538bdf8), 0.0f, 0.0f,
-                                   juce::Colours::transparentBlack, 0.0f, h, false);
-    g.setGradientFill(waveGrad);
-    g.fillPath(fillPath);
-
-    // Stroke
-    g.setColour(juce::Colour(0xff38bdf8).withAlpha(0.9f));
-    g.strokePath(strokePath, juce::PathStrokeType(1.5f));
-
-    // Sample Start marker
-    if (startPos > 0.0f)
-    {
-        float startX = startPos * w;
-        g.setColour(juce::Colour(0xff4ade80).withAlpha(0.8f));
-        g.drawLine(startX, 0.0f, startX, h, 1.5f);
-    }
-
-    // Loop Length marker
-    if (loopLen > 0.0f && loopLen < 1.0f)
-    {
-        float loopX = loopLen * w;
-        g.setColour(juce::Colour(0xfff5a623).withAlpha(0.75f));
-        g.drawLine(loopX, 0.0f, loopX, h, 1.5f);
-
-        if (startPos < loopLen)
-        {
-            g.setColour(juce::Colour(0xfff5a623).withAlpha(0.07f));
-            g.fillRect(startPos * w, 0.0f, loopX - startPos * w, h);
-        }
-    }
-
-    // Playhead
-    if (playbackPos >= 0.0f && playbackPos <= 1.0f)
-    {
-        float x = playbackPos * w;
-        g.setColour(juce::Colour(0xffffffff).withAlpha(0.9f));
-        g.drawLine(x, 0.0f, x, h, 1.5f);
-
-        // Small downward triangle at top
-        juce::Path arrow;
-        arrow.addTriangle(x - 4.0f, 0.0f, x + 4.0f, 0.0f, x, 5.0f);
-        g.fillPath(arrow);
-    }
-}
-
-void WaveformComponent::resized()
-{
-}
-
-void WaveformComponent::setWaveform(const std::vector<float>& audioData)
-{
-    waveform = audioData;
+    waveform = std::move (audioData);
+    peaks.clear();
     repaint();
 }
 
-void WaveformComponent::setPlaybackPosition(float normalizedPosition)
+void WaveformComponent::setPlaybackPosition (float normalizedPosition)
 {
+    if (std::abs (normalizedPosition - playbackPos) < 0.0005f)
+        return;
     playbackPos = normalizedPosition;
     repaint();
 }
 
-void WaveformComponent::setLoopLength(float normalizedLength)
+void WaveformComponent::setRegion (float normalizedStart, float normalizedEnd)
 {
-    loopLen = normalizedLength;
+    if (normalizedStart == regionStart && normalizedEnd == regionEnd)
+        return;
+    regionStart = normalizedStart;
+    regionEnd = normalizedEnd;
     repaint();
 }
 
-void WaveformComponent::setSampleStart(float normalizedStart)
+void WaveformComponent::computePeaks (int width)
 {
-    startPos = normalizedStart;
-    repaint();
+    peaks.assign ((size_t) width, { 0.0f, 0.0f });
+    const size_t n = waveform.size();
+    if (n == 0 || width <= 0)
+        return;
+
+    for (int x = 0; x < width; ++x)
+    {
+        const size_t from = (size_t) x * n / (size_t) width;
+        const size_t to = std::max (from + 1, (size_t) (x + 1) * n / (size_t) width);
+        float lo = waveform[from], hi = waveform[from];
+        for (size_t i = from; i < to && i < n; ++i)
+        {
+            lo = std::min (lo, waveform[i]);
+            hi = std::max (hi, waveform[i]);
+        }
+        peaks[(size_t) x] = { lo, hi };
+    }
 }
 
-void WaveformComponent::setFades(float normalizedIn, float normalizedOut)
+void WaveformComponent::paint (juce::Graphics& g)
 {
-    // Kept for compatibility but unused
-    repaint();
+    using namespace LatentPalette;
+    const auto bounds = getLocalBounds().toFloat();
+    const float w = bounds.getWidth(), h = bounds.getHeight();
+    const float mid = h * 0.5f, scale = h * 0.45f;
+
+    g.setColour (darkBg());
+    g.fillRect (bounds);
+
+    // Region that actually plays
+    const float rx0 = regionStart * w, rx1 = std::max (rx0 + 1.0f, regionEnd * w);
+    g.setColour (accentAmber().withAlpha (0.06f));
+    g.fillRect (rx0, 0.0f, rx1 - rx0, h);
+
+    g.setColour (juce::Colour (0xff1a1a30));
+    g.drawHorizontalLine ((int) mid, 0.0f, w);
+
+    if (waveform.empty())
+    {
+        g.setColour (textSecondary().withAlpha (0.5f));
+        g.setFont (juce::FontOptions (11.0f));
+        g.drawText ("Generated sound appears here", bounds, juce::Justification::centred);
+    }
+    else
+    {
+        if ((int) peaks.size() != (int) w)
+            computePeaks ((int) w);
+
+        juce::Path shape;
+        shape.startNewSubPath (0.0f, mid - peaks.front().second * scale);
+        for (size_t x = 1; x < peaks.size(); ++x)
+            shape.lineTo ((float) x, mid - peaks[x].second * scale);
+        for (size_t x = peaks.size(); x-- > 0;)
+            shape.lineTo ((float) x, mid - peaks[x].first * scale);
+        shape.closeSubPath();
+
+        g.setColour (accentCyan().withAlpha (0.55f));
+        g.fillPath (shape);
+        g.setColour (accentCyan().withAlpha (0.9f));
+        g.strokePath (shape, juce::PathStrokeType (0.8f));
+
+        // Dim what lies outside the region
+        g.setColour (darkBg().withAlpha (0.55f));
+        g.fillRect (0.0f, 0.0f, rx0, h);
+        g.fillRect (rx1, 0.0f, w - rx1, h);
+    }
+
+    // Region markers
+    g.setColour (accentGreen().withAlpha (0.8f));
+    g.drawVerticalLine ((int) rx0, 0.0f, h);
+    g.setColour (accentAmber().withAlpha (0.8f));
+    g.drawVerticalLine ((int) std::min (rx1, w - 1.0f), 0.0f, h);
+
+    if (playbackPos >= 0.0f && playbackPos <= 1.0f)
+    {
+        const float x = playbackPos * w;
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
+        g.drawLine (x, 0.0f, x, h, 1.5f);
+        juce::Path arrow;
+        arrow.addTriangle (x - 4.0f, 0.0f, x + 4.0f, 0.0f, x, 5.0f);
+        g.fillPath (arrow);
+    }
+
+    g.setColour (borderCol());
+    g.drawRect (bounds, 1.0f);
 }

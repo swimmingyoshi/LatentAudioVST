@@ -18,199 +18,232 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <atomic>
 #include "SoundMap.h"
 #include "LatentDecoder.h"
 #include "InferenceThread.h"
 
 //==============================================================================
-
-//==============================================================================
+// Threading model
+// ---------------
+//  * Audio thread    : processBlock. Owns the voice, playback buffers and filter.
+//                      Never blocks: it only try-locks and reads atomics.
+//  * Inference thread: decodes the latest requested position and publishes the
+//                      result into `pendingAudio` (spin-lock held for a swap only).
+//  * Loader thread   : loads model folders so the UI never freezes.
+//  * Message thread  : UI and host state calls. Sends commands via atomics.
+//
+// A model generation counter tags every decode, so audio decoded by a previous
+// model is dropped instead of played after a switch.
 class LatentAudioVSTAudioProcessor : public juce::AudioProcessor,
-                                      public juce::AudioProcessorValueTreeState::Listener
+                                      private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     LatentAudioVSTAudioProcessor();
     ~LatentAudioVSTAudioProcessor() override;
 
-    // Model loading
-    void setModelPath(const juce::File& path);
-    void setSoundMapPath(const juce::File& path);
-    void loadModelAndMap();
-    bool loadModelFolder(const juce::File& folder);
-
-    // Manual unload
-    bool unloadModel(const juce::String& modelPath);
-
-    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
-    void releaseResources() override;
-
-#ifndef JucePlugin_PreferredChannelConfigurations
-    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
-#endif
-
-    void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    //==========================================================================
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override {}
+    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    using AudioProcessor::processBlock;
 
     juce::AudioProcessorEditor* createEditor() override;
-    bool hasEditor() const override;
+    bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override;
+    const juce::String getName() const override { return JucePlugin_Name; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.05; }
 
-    bool acceptsMidi() const override;
-    bool producesMidi() const override;
-    bool isMidiEffect() const override;
-    double getTailLengthSeconds() const override;
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
 
-    int getNumPrograms() override;
-    int getCurrentProgram() override;
-    void setCurrentProgram(int index) override;
-    const juce::String getProgramName(int index) override;
-    void changeProgramName(int index, const juce::String& newName) override;
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
 
-    void getStateInformation(juce::MemoryBlock& destData) override;
-    void setStateInformation(const void* data, int sizeInBytes) override;
+    //==========================================================================
+    // Model management (message thread)
+    enum class LoadState { Empty, Loading, Ready, Failed };
 
-    // APVTS
+    struct LoadStatus
+    {
+        LoadState state = LoadState::Empty;
+        juce::String message;   // human readable status / error
+        juce::File folder;      // folder of the current (or last attempted) model
+    };
+
+    // Loads asynchronously. Accepts a folder (containing an .onnx + sound map
+    // .json), or the .onnx / .json file itself.
+    void loadModelFolderAsync (const juce::File& folderOrFile);
+    void unloadModel();
+    LoadStatus getLoadStatus() const;
+    bool waitForModelLoad (int timeoutMs) const; // for tests / offline rendering
+
+    // Finds the model + sound map inside a folder. Prefers "sound_map.json".
+    static bool findModelFiles (const juce::File& folderOrFile, juce::File& onnx, juce::File& json, juce::String& error);
+
+    //==========================================================================
+    // UI interaction (message thread)
+    // Click (restart = true) or drag (restart = false: keep playing, crossfade to the new sound).
+    void triggerFromUI (float mapX, float mapY, bool restart = true);
+    void releaseFromUI();                         // mouse up (ends the automation gesture)
+    void moveCursorFromUI (float mapX, float mapY); // move without auditioning
+    void triggerRandomPosition();
+    void resetParametersToDefaults();
+
+    // Lets state restore and tests hand decoded audio to the player.
+    void injectDecodedAudio (std::vector<float> audio);
+
+    //==========================================================================
+    // Read-only views for the editor (any thread)
+    std::shared_ptr<const SoundMapData> getMapSnapshot() const { return soundMap.snapshot(); }
+    juce::String getActiveProvider() const { return decoder.getActiveProvider(); }
+    juce::Point<float> getCursor() const { return { currentX.load(), currentY.load() }; }
+    float getPlayheadNormalized() const { return playheadNorm.load(); }
+    bool hasAudio() const { return audioAvailable.load(); }
+    uint32_t getMidiActivityCount() const { return midiActivityCount.load(); }
+    uint32_t getDisplayVersion() const { return displayVersion.load(); }
+    void copyDisplayWaveform (std::vector<float>& dest) const;
+    int getModelSampleRate() const { return modelSampleRate.load(); }
+
+    juce::AudioProcessorValueTreeState& getAPVTS() { return *parameters; }
+
+    // Map <-> normalised position parameter conversion (Y is inverted: 1 = top).
+    static juce::Point<float> mapToNormalized (const SoundMapData& map, float x, float y);
+    static juce::Point<float> normalizedToMap (const SoundMapData& map, float nx, float ny);
+
+private:
+    //==========================================================================
+    void parameterChanged (const juce::String& parameterID, float newValue) override;
+    void applyPositionParameters();
+    void requestInference (bool audition);
+    void setCursorAndSyncHost (float x, float y, bool notifyHost);
+
+    // Inference thread
+    void serviceInference();
+    bool decodeAt (float x, float y, std::vector<float>& audio) const;
+    static bool postProcess (std::vector<float>& audio);
+    void publishAudio (std::vector<float>&& audio, uint32_t generation);
+
+    // Loader thread
+    void runLoadJob (juce::File folderOrFile, bool keepRestoredAudio, uint32_t token);
+
+    // Audio thread
+    void takePendingAudio();
+    void renderOfflineInference();
+    void handleMidi (const juce::MidiMessage& m);
+    void startVoice (int note, float velocity);
+    void releaseVoice();
+    void renderVoice (float* out, int startSample, int endSample, double baseSpeed);
+    void finishCrossfade();
+
+    //==========================================================================
     std::unique_ptr<juce::AudioProcessorValueTreeState> parameters;
 
-    // APVTS listener
-    void parameterChanged(const juce::String& parameterID, float newValue) override;
+    // Raw parameter values (read lock-free on the audio thread)
+    std::atomic<float>* pRate = nullptr;
+    std::atomic<float>* pTune = nullptr;
+    std::atomic<float>* pLoopXfade = nullptr;
+    std::atomic<float>* pCutoff = nullptr;
+    std::atomic<float>* pReso = nullptr;
+    std::atomic<float>* pGain = nullptr;
+    std::atomic<float>* pMix = nullptr;
+    std::atomic<float>* pEnd = nullptr;
+    std::atomic<float>* pStart = nullptr;
+    std::atomic<float>* pPosX = nullptr;
+    std::atomic<float>* pPosY = nullptr;
+    std::atomic<float>* pInferenceRate = nullptr;
+    std::atomic<float>* pLatch = nullptr;
+    std::atomic<float>* pTriggerOnMidi = nullptr;
+    std::atomic<float>* pKeyTrack = nullptr;
+    std::atomic<float>* pRootNote = nullptr;
+    std::atomic<float>* pVelocity = nullptr;
 
-    // Trigger inference from UI
-    // syncToHost = true: notify DAW (automation recording from cursor drag / random)
-    // syncToHost = false: called from parameter callback or processBlock — skip the
-    //                     setValueNotifyingHost echo that would re-trigger inference
-    void triggerInference(float x, float y, bool syncToHost = true);
-    void triggerRandomPosition(); // NEW
-    void releaseNote();
-
-    // Parameter setters
-    void setPlaybackSpeed(float newSpeed);
-    void setFineTune(float multiplier); // NEW
-    void setCrossfade(float amount);
-    void setLatch(bool shouldLatch);
-    void setGain(float newGain);
-    void setMix(float wetAmount); // NEW
-    void setFilterCutoff(float cutoffHz);
-    void setFilterResonance(float reso); // NEW
-    void setTriggerOnMidi(bool shouldTrigger);
-    void setPositionX(float normalizedX);
-    void setPositionY(float normalizedY);
-    void setSampleLength(float len);
-    void setSampleStart(float start);
-
-    // Public data
+    //==========================================================================
     SoundMap soundMap;
     LatentDecoder decoder;
 
-    // Accessors
-    float getPlaybackPositionNormalized() const;
-    const std::vector<float>& getGeneratedWaveform() const { return lastGeneratedWaveform; }
-    bool isMidiActive() const { return midiActive.load(); }
+    // Cursor in map coordinates, and decode requests (latest wins).
+    std::atomic<float> currentX { 0.0f }, currentY { 0.0f };
+    std::atomic<uint32_t> requestSeq { 0 };
+    std::atomic<bool> playOnArrival { false };
+    std::atomic<bool> syncingPositionParams { false };
+    bool uiGestureActive = false; // message thread only
 
-    // Parameters
+    // Map bounds mirrored as atomics for audio-thread parameter mapping.
+    std::atomic<float> mapMinX { -1.0f }, mapMaxX { 1.0f }, mapMinY { -1.0f }, mapMaxY { 1.0f };
+    std::atomic<int> modelSampleRate { 44100 };
+    std::atomic<uint32_t> modelGeneration { 1 };
 
-    std::atomic<bool> newWaveformAvailable{ false };
-    std::atomic<float> lpCutoff{ 10000.0f };
-    std::atomic<float> lpReso{ 0.0f }; // NEW
-    std::atomic<float> currentX{ 0.0f }; // NEW: Track active cursor position
-    std::atomic<float> currentY{ 0.0f }; // NEW: Track active cursor position
-    std::atomic<bool> midiActive{ false }; // NEW: Track MIDI activity
-    int midiActivityCounter{ 0 }; // NEW: Counter to clear MIDI activity after timeout
+    // Inference -> audio hand-off
+    juce::SpinLock pendingLock;
+    std::vector<float> pendingAudio;     // guarded by pendingLock
+    uint32_t pendingGeneration = 0;      // guarded by pendingLock
+    std::atomic<bool> pendingReady { false };
 
-    std::atomic<bool> isLatch{ false }; // Moved to public for Editor access
-    std::atomic<float> sampleLength{ 1.0f }; // Moved to public for Editor access
-    std::atomic<float> sampleStart{ 0.0f }; // Moved to public for Editor access
+    // Inference -> UI
+    mutable juce::CriticalSection displayLock;
+    std::vector<float> displayWaveform;  // guarded by displayLock
+    std::atomic<uint32_t> displayVersion { 0 };
 
-    // Model paths
-    juce::File modelPath;
-    juce::File soundMapPath;
+    // UI -> audio commands
+    std::atomic<bool> startRequested { false };
+    std::atomic<bool> resetRequested { false };
 
-private:
+    // Audio -> UI
+    std::atomic<float> playheadNorm { -1.0f };
+    std::atomic<bool> audioAvailable { false };
+    std::atomic<uint32_t> midiActivityCount { 0 };
+
+    // Inference thread state
+    uint32_t servicedSeq = 0;
+    double lastDecodeMs = 0.0;
     InferenceThread inferenceThread;
 
-    // Double buffering
-    juce::AudioBuffer<float> soundBuffers[2];
-    std::atomic<int> activeBufferIndex{ 0 };
+    // Loader
+    juce::ThreadPool loaderPool { 1 };
+    mutable juce::CriticalSection statusLock;
+    LoadStatus status;                    // guarded by statusLock
+    std::atomic<uint32_t> loadToken { 0 };
+    std::atomic<bool> loadInProgress { false };
 
-    // Crossfade state
-    std::atomic<bool> triggerCrossfade{ false };
-    bool isCrossfading = false;
-    float crossfadePosition = 0.0f;
-    float crossfadeIncrement = 0.0f;
+    //==========================================================================
+    // Audio-thread-only state
+    struct Voice
+    {
+        bool playing = false;
+        bool released = false;
+        double pos = 0.0;
+        float envLevel = 0.0f;
+        float velocityGain = 1.0f;
+        double noteRatio = 1.0;
+        int note = -1;
+    };
 
-    std::atomic<int> playbackPosition{ -1 };
-    std::atomic<float> playbackSpeed{ 1.0f };
-    std::atomic<float> fineTuneMultiplier{ 1.0f }; // NEW
-    std::atomic<float> crossfade{ 0.05f };
+    Voice voice;
+    std::vector<float> activeAudio, incomingAudio;
+    bool crossfading = false;
+    float crossfadePos = 0.0f, crossfadeInc = 0.0f;
+    bool waitingNoteStart = false;
+    int waitingNote = -1;
+    float waitingVelocity = 1.0f;
+    bool lastLatch = false;
+    uint32_t offlineServicedSeq = 0;
 
-    // NEW parameters
-    std::atomic<float> mixAmount{ 1.0f }; // 0=dry, 1=wet
+    // Retrigger declick: fades out the old read head when a voice restarts.
+    double stealPos = 0.0, stealSpeed = 1.0;
+    float stealGain = 0.0f, stealInc = 0.0f;
 
-    // Parameter automation throttling
-    float lastParamX = 0.0f;
-    float lastParamY = 0.0f;
-    std::atomic<float> inferenceRate{ 10.0f };
-    float paramUpdateCounter = 0.0f; // For background inference rate limiting
-
-    // Background inference position tracking
-    float lastBackgroundX = 0.0f;
-    float lastBackgroundY = 0.0f;
-    bool backgroundPositionChanged = false;
-
-    // Guard flag to prevent feedback loop when syncing position parameters
-    std::atomic<bool> syncingPositionParams{ false };
-
-    // Envelope params (hardcoded quick-gate — no user controls)
-    std::atomic<float> attackTime{ 0.001f };
-    std::atomic<float> decayTime{ 0.001f };
-    std::atomic<float> sustainLevel{ 1.0f };
-    std::atomic<float> releaseTime{ 0.02f };
-
-    std::atomic<bool> triggerOnMidi{ false };
-    std::atomic<float> outputGain{ 1.0f };
-
-    // Envelope state machine
-    enum class EnvelopeState { Idle, Attack, Decay, Sustain, Release };
-    EnvelopeState envState{ EnvelopeState::Idle };
-    float currentEnvLevel{ 0.0f };
-
-    float fractionalPosition = 0.0f;
-
-    std::vector<float> lastGeneratedWaveform;
-    std::vector<float> dryBuffer; // NEW: Store unprocessed audio
-    juce::CriticalSection bufferLock;
-
-    // DSP
-    juce::IIRFilter lpFilter1;
-    juce::IIRFilter lpFilter2;
-
-    // Filter coefficient caching
-    juce::IIRCoefficients currentCoeffs;
-    float lastCutoff = -1.0f;
-    float lastReso = -1.0f;
-
-//==============================================================================
-// ADD TO PluginProcessor.h private members:
-double currentSampleRate = 44100.0;
-std::atomic<bool> hasValidAudio{false};  // NEW: Track if we have audio to play
-std::atomic<bool> isFirstProcess{true};  // NEW: Track first process call for auto-generation
-juce::CriticalSection filterLock;        // NEW: Protect filter state
-
-// Offline mode (export) support - run synchronous inference
-std::atomic<bool> isOfflineMode{false};
-
-// Set to true for the duration of a model switch so onInferenceFinished
-// discards any stale in-flight result from the old model.
-std::atomic<bool> modelSwitchPending{false};
-std::vector<float> offlineLatentBuffer;
-std::vector<float> offlineAudioBuffer;
-float lastOfflineX = -999.0f;
-float lastOfflineY = -999.0f;
-
-// Helper for synchronous inference in offline mode
-void processOfflinePositionChange(float x, float y);
-
-    void applyPostProcessing(std::vector<float>& audio);
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LatentAudioVSTAudioProcessor)
+    double hostSampleRate = 44100.0;
+    juce::dsp::StateVariableTPTFilter<float> filterA, filterB;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> cutoffSmoothed;
+    juce::SmoothedValue<float> gainSmoothed;
+    JUCE_DECLARE_WEAK_REFERENCEABLE (LatentAudioVSTAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LatentAudioVSTAudioProcessor)
 };

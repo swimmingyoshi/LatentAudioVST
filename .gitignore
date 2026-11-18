@@ -183,3 +183,8 @@ Ctemp
 JuceLibraryCode
 KickModel
 AGENTS.md
+# Test runner build output
+Tests/build/
+
+# Tiny deterministic test model (70 KB) is tracked on purpose
+!Tests/data/tiny_model/latent_decoder.onnx

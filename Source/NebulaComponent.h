@@ -19,58 +19,62 @@
 
 #include <JuceHeader.h>
 #include "SoundMap.h"
-#include "PluginProcessor.h"
 
 //==============================================================================
+// 2D sound map ("nebula"). Left click/drag picks a position, right/middle drag
+// pans, wheel zooms toward the mouse, double-click resets the view.
 class NebulaComponent : public juce::Component
 {
 public:
-    NebulaComponent (SoundMap& map);
-    ~NebulaComponent() override;
+    NebulaComponent() = default;
+
+    void setMap (std::shared_ptr<const SoundMapData> newMap);
+    void setCursorPosition (float x, float y);
+    void setSnapping (bool shouldSnap) { isSnapping = shouldSnap; }
+    void resetView();
+
+    // Text drawn over the map (loading / errors / empty state). Empty = none.
+    void setOverlayMessage (const juce::String& message, bool isError = false);
+
+    std::function<void (float, float, bool isDrag)> onCursorChanged;  // map coordinates
+    std::function<void()> onMouseReleased;
 
     void paint (juce::Graphics&) override;
-    void resized() override;
+    void resized() override { layerDirty = true; }
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
 
-    void mouseDown (const juce::MouseEvent& event) override;
-    void mouseDrag (const juce::MouseEvent& event) override;
-    void mouseUp (const juce::MouseEvent& event) override;
-    void mouseExit (const juce::MouseEvent& event) override;
-    void mouseWheelMove (const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
-
-    // Callback when the cursor position changes (x, y in map coordinates)
-    std::function<void (float, float)> onCursorChanged;
-    
-    // Callback when the mouse is released
-    std::function<void ()> onMouseReleased;
-
-    // Settings
-    void setSnapping (bool shouldSnap);
-    void setCursorPosition(float x, float y);
-    void resetView(); // Reset zoom and pan to default
-
-
-
-private:
-    SoundMap& soundMap;
-
-    // Current cursor position in map coordinates
-    float cursorX = 0.0f;
-    float cursorY = 0.0f;
-    
-    bool isSnapping = false;
-
-    // View Transform
-    float zoomFactor = 1.0f;
-    float panX = 0.0f; // Map coordinate offset X
-    float panY = 0.0f; // Map coordinate offset Y
-    
-    // Panning state
-    float startPanX = 0.0f;
-    float startPanY = 0.0f;
-
-    // Helper to map coordinates
     juce::Point<float> mapToScreen (float x, float y) const;
     juce::Point<float> screenToMap (float x, float y) const;
+
+private:
+    void pickAt (juce::Point<float> screenPos, bool isDrag);
+    void rebuildPointsLayer();
+    void updateNeighbours();
+    bool isPanGesture (const juce::MouseEvent& e) const;
+
+    std::shared_ptr<const SoundMapData> map;
+    juce::Image pointsLayer;
+    bool layerDirty = true;
+
+    float cursorX = 0.0f, cursorY = 0.0f;
+    std::vector<int> neighbours;          // nearest points to the cursor (the blend)
+    std::vector<float> neighbourWeights;  // their IDW weights, summing to 1
+    int hoverIndex = -1;
+
+    bool isSnapping = false;
+    bool isPanning = false;
+    float zoom = 1.0f;
+    float panX = 0.0f, panY = 0.0f;       // view centre offset from map centre (map units)
+    float panStartX = 0.0f, panStartY = 0.0f;
+
+    juce::String overlay;
+    bool overlayIsError = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NebulaComponent)
 };

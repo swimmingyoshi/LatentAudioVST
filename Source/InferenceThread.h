@@ -18,99 +18,46 @@
 #pragma once
 
 #include <JuceHeader.h>
-#include "LatentDecoder.h"
+#include <functional>
 
 //==============================================================================
+// Background worker that runs model inference off the audio thread.
+//
+// It does not queue work. The owner publishes the latest request through
+// atomics and the worker calls `service` whenever it wakes, so any number of
+// position changes collapse into a single decode of the newest position.
+//
+// Waking: wake() is for non-realtime threads. The audio thread must not call
+// it (WaitableEvent takes a mutex); the 2 ms poll picks up its requests.
 class InferenceThread : public juce::Thread
 {
 public:
-    InferenceThread (LatentDecoder& d)
-        : juce::Thread ("InferenceThread"), decoder (d)
+    explicit InferenceThread (std::function<void()> serviceCallback)
+        : juce::Thread ("LatentAudio Inference"), service (std::move (serviceCallback))
     {
-        juce::Logger::writeToLog("[InferenceThread] === CONSTRUCTOR ===");
-        juce::Logger::writeToLog("[InferenceThread] this=" + juce::String::toHexString((juce::int64)this));
-        // Reserve memory to avoid reallocations
-        inputLatent.resize (128, 0.0f);
-        outputAudio.reserve (44100);
     }
 
     ~InferenceThread() override
     {
-        juce::Logger::writeToLog("[InferenceThread] === DESTRUCTOR ===");
-        juce::Logger::writeToLog("[InferenceThread] this=" + juce::String::toHexString((juce::int64)this));
         stopThread (4000);
-        juce::Logger::writeToLog("[InferenceThread] Thread stopped");
     }
 
-    void trigger (const std::vector<float>& latent)
-    {
-        // juce::Logger::writeToLog("[InferenceThread::trigger] Called with latent size=" + juce::String(latent.size()));
-        // Thread-safe copy of input
-        {
-            const juce::ScopedLock sl (lock);
-            // Resize if needed to accept any latent dimension
-            if (latent.size() != inputLatent.size())
-                inputLatent.resize(latent.size());
-            inputLatent = latent;
-        }
-        // juce::Logger::writeToLog("[InferenceThread::trigger] Signaling thread...");
-        startSignal.signal();
-    }
+    void wake() { signal.signal(); }
 
     void run() override
     {
-        juce::Logger::writeToLog("[InferenceThread] === THREAD STARTED ===");
-        juce::Logger::writeToLog("[InferenceThread] Thread ID: " + juce::String::toHexString((juce::int64)juce::Thread::getCurrentThreadId()));
-
         while (! threadShouldExit())
         {
-            // Wait for trigger - only proceed if actually signaled (not on timeout)
-            bool signaled = startSignal.wait (100); // 100ms timeout to check exit condition
-
-            if (! signaled)
-                continue; // Timeout, not signaled - loop back and wait again
-
-            // juce::Logger::writeToLog("[InferenceThread] Signal received, processing...");
-
+            signal.wait (2);
             if (threadShouldExit())
-            {
-                juce::Logger::writeToLog("[InferenceThread] Exit requested during signal");
                 break;
-            }
-
-            // Copy input locally to avoid holding lock during inference
-            std::vector<float> localInput;
-            {
-                const juce::ScopedLock sl (lock);
-                localInput = inputLatent;
-            }
-
-            // Run Inference (Slow)
-            // juce::Logger::writeToLog("[InferenceThread] Running inference with input size=" + juce::String(localInput.size()));
-            // juce::Logger::writeToLog("[InferenceThread] decoder.isModelLoaded()=" + juce::String(decoder.isModelLoaded() ? "TRUE" : "FALSE"));
-
-            if (decoder.decode (localInput, outputAudio))
-            {
-                // juce::Logger::writeToLog("[InferenceThread] Inference successful, output size=" + juce::String(outputAudio.size()));
-                if (onInferenceFinished)
-                    onInferenceFinished (outputAudio);
-            }
-            else
-            {
-                juce::Logger::writeToLog("[InferenceThread] Inference FAILED");
-            }
+            service();
         }
-
-        juce::Logger::writeToLog("[InferenceThread] === THREAD EXITING ===");
     }
 
-    std::function<void (const std::vector<float>&)> onInferenceFinished;
-
 private:
-    LatentDecoder& decoder;
-    juce::WaitableEvent startSignal;
-    juce::CriticalSection lock;
-    
-    std::vector<float> inputLatent;
-    std::vector<float> outputAudio;
+    std::function<void()> service;
+    juce::WaitableEvent signal;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (InferenceThread)
 };

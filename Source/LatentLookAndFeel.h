@@ -179,7 +179,7 @@ public:
         g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, 1.0f);
 
         g.setColour(isOn ? textPrimary() : textSecondary());
-        g.setFont(juce::Font(10.5f));
+        g.setFont(juce::FontOptions(12.5f));
         g.drawFittedText(button.getButtonText(), button.getLocalBounds(),
                          juce::Justification::centred, 1);
     }
@@ -187,12 +187,12 @@ public:
     //==========================================================================
     juce::Font getTextButtonFont(juce::TextButton&, int buttonHeight) override
     {
-        return juce::Font(juce::jmin(14.0f, (float)buttonHeight * 0.75f));
+        return juce::Font(juce::FontOptions(juce::jmin(13.0f, (float)buttonHeight * 0.6f)));
     }
 
     juce::Font getLabelFont(juce::Label& label) override
     {
-        return juce::Font(11.0f);
+        return juce::Font(juce::FontOptions(11.5f));
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LatentLookAndFeel)

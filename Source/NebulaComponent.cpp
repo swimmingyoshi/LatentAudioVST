@@ -16,343 +16,344 @@
 */
 
 #include "NebulaComponent.h"
+#include "LatentLookAndFeel.h"
+
+namespace
+{
+    constexpr int kBlendNeighbours = 5;   // must match SoundMapData::interpolate's default
+    constexpr float kHoverRadius = 10.0f; // px
+}
 
 //==============================================================================
-NebulaComponent::NebulaComponent (SoundMap& map) : soundMap (map)
+void NebulaComponent::setMap (std::shared_ptr<const SoundMapData> newMap)
 {
-    // Initialize cursor to center or first point
-    cursorX = 0.0f;
-    cursorY = 0.0f;
+    if (newMap == map)
+        return;
+    map = std::move (newMap);
+    hoverIndex = -1;
+    resetView();
+    updateNeighbours();
 }
 
-NebulaComponent::~NebulaComponent()
+void NebulaComponent::setCursorPosition (float x, float y)
 {
-}
-
-void NebulaComponent::paint (juce::Graphics& g)
-{
-    auto w      = (float) getWidth();
-    auto h      = (float) getHeight();
-    auto bounds = getLocalBounds().toFloat();
-
-    // ── Background ──────────────────────────────────────────────────────────
-    g.fillAll (juce::Colour (0xff0d0d1a));
-
-    // Subtle radial vignette (slightly darker at corners)
-    {
-        juce::ColourGradient vig (juce::Colours::transparentBlack, w * 0.5f, h * 0.5f,
-                                   juce::Colour (0x55000000), 0.0f, 0.0f, true);
-        g.setGradientFill (vig);
-        g.fillRect (bounds);
-    }
-
-    // Fine dot-grid
-    g.setColour (juce::Colour (0xff1a1a30));
-    for (float gx = 0.0f; gx < w; gx += 28.0f)
-        for (float gy = 0.0f; gy < h; gy += 28.0f)
-            g.fillRect (gx, gy, 1.0f, 1.0f);
-
-    // Border
-    g.setColour (juce::Colour (0xff2a2a4a));
-    g.drawRect (bounds, 1.0f);
-
-    // ── Sound Points ─────────────────────────────────────────────────────────
-    const auto& points = soundMap.getPoints();
-
-    if (points.empty())
-    {
-        g.setFont (juce::Font (14.0f));
-        g.setColour (juce::Colour (0xff333355));
-        g.drawFittedText ("Load a model folder to explore the sound space",
-                          getLocalBounds().reduced (20), juce::Justification::centred, 2);
-    }
-    else
-    {
-        for (const auto& p : points)
-        {
-            auto pt = mapToScreen (p.x, p.y);
-            if (!std::isfinite (pt.x) || !std::isfinite (pt.y)) continue;
-
-            // Soft radial glow
-            float glowR = 9.0f;
-            juce::ColourGradient glow (juce::Colour (0x4038bdf8), pt.x, pt.y,
-                                        juce::Colours::transparentBlack,
-                                        pt.x + glowR, pt.y, true);
-            g.setGradientFill (glow);
-            g.fillEllipse (pt.x - glowR, pt.y - glowR, glowR * 2.0f, glowR * 2.0f);
-
-            // Core dot
-            g.setColour (juce::Colour (0xff38bdf8).withAlpha (0.75f));
-            g.fillEllipse (pt.x - 2.0f, pt.y - 2.0f, 4.0f, 4.0f);
-        }
-    }
-
-    // ── Cursor ────────────────────────────────────────────────────────────────
-    auto cursorPt = mapToScreen (cursorX, cursorY);
-    if (std::isfinite (cursorPt.x) && std::isfinite (cursorPt.y))
-    {
-        constexpr float ringR  = 9.0f;
-        constexpr float glowR  = 20.0f;
-        constexpr float lineIn = 12.0f;  // gap from centre
-        constexpr float lineOut = 20.0f; // end of crosshair arm
-        float cx = cursorPt.x, cy = cursorPt.y;
-
-        // Wide ambient glow
-        {
-            juce::ColourGradient glow (juce::Colour (0x28f5a623), cx, cy,
-                                        juce::Colours::transparentBlack,
-                                        cx + glowR, cy, true);
-            g.setGradientFill (glow);
-            g.fillEllipse (cx - glowR, cy - glowR, glowR * 2.0f, glowR * 2.0f);
-        }
-
-        // Outer dim ring
-        g.setColour (juce::Colour (0x40f5a623));
-        g.drawEllipse (cx - 14.0f, cy - 14.0f, 28.0f, 28.0f, 1.0f);
-
-        // Main ring
-        g.setColour (juce::Colour (0xfff5a623));
-        g.drawEllipse (cx - ringR, cy - ringR, ringR * 2.0f, ringR * 2.0f, 1.5f);
-
-        // Gap crosshair (lines start outside the ring)
-        g.drawLine (cx,         cy - lineOut, cx,         cy - lineIn,  1.5f);
-        g.drawLine (cx,         cy + lineIn,  cx,         cy + lineOut, 1.5f);
-        g.drawLine (cx - lineOut, cy,         cx - lineIn, cy,           1.5f);
-        g.drawLine (cx + lineIn,  cy,         cx + lineOut, cy,          1.5f);
-
-        // Centre dot
-        g.fillEllipse (cx - 2.0f, cy - 2.0f, 4.0f, 4.0f);
-    }
-}
-
-void NebulaComponent::resized()
-{
-}
-
-void NebulaComponent::setSnapping (bool shouldSnap)
-{
-    isSnapping = shouldSnap;
-}
-
-void NebulaComponent::setCursorPosition(float x, float y)
-{
+    if (x == cursorX && y == cursorY)
+        return;
     cursorX = x;
     cursorY = y;
+    updateNeighbours();
     repaint();
 }
 
 void NebulaComponent::resetView()
 {
-    zoomFactor = 1.0f;
-    panX = 0.0f;
-    panY = 0.0f;
+    zoom = 1.0f;
+    panX = panY = 0.0f;
+    layerDirty = true;
     repaint();
 }
 
-void NebulaComponent::mouseDown (const juce::MouseEvent& event)
+void NebulaComponent::setOverlayMessage (const juce::String& message, bool isError)
 {
-    // Store pan start state
-    if (event.mods.isRightButtonDown() || event.mods.isMiddleButtonDown())
-    {
-        startPanX = panX;
-        startPanY = panY;
+    if (message == overlay && isError == overlayIsError)
         return;
+    overlay = message;
+    overlayIsError = isError;
+    repaint();
+}
+
+void NebulaComponent::updateNeighbours()
+{
+    neighbours.clear();
+    neighbourWeights.clear();
+    if (map == nullptr || map->points.empty())
+        return;
+
+    neighbours = map->nearestIndices (cursorX, cursorY, kBlendNeighbours);
+    float total = 0.0f;
+    for (int idx : neighbours)
+    {
+        const auto& p = map->points[(size_t) idx];
+        const float d2 = juce::square (p.x - cursorX) + juce::square (p.y - cursorY);
+        const float w = d2 < 1.0e-10f ? 1.0e10f : 1.0f / d2;
+        neighbourWeights.push_back (w);
+        total += w;
+    }
+    for (auto& w : neighbourWeights)
+        w /= total;
+}
+
+//==============================================================================
+juce::Point<float> NebulaComponent::mapToScreen (float x, float y) const
+{
+    const float w = (float) getWidth(), h = (float) getHeight();
+    if (map == nullptr || w <= 0.0f || h <= 0.0f)
+        return { w * 0.5f, h * 0.5f };
+
+    const float cx = map->minX + map->rangeX() * 0.5f + panX;
+    const float cy = map->minY + map->rangeY() * 0.5f + panY;
+    // 6% margin so edge points (and their glow) are never clipped.
+    const float scale = zoom * 0.94f;
+    return { ((x - cx) / map->rangeX() * scale + 0.5f) * w,
+             ((y - cy) / map->rangeY() * scale + 0.5f) * h };
+}
+
+juce::Point<float> NebulaComponent::screenToMap (float sx, float sy) const
+{
+    const float w = (float) getWidth(), h = (float) getHeight();
+    if (map == nullptr || w <= 0.0f || h <= 0.0f)
+        return {};
+
+    const float cx = map->minX + map->rangeX() * 0.5f + panX;
+    const float cy = map->minY + map->rangeY() * 0.5f + panY;
+    const float scale = zoom * 0.94f;
+    return { cx + (sx / w - 0.5f) * map->rangeX() / scale,
+             cy + (sy / h - 0.5f) * map->rangeY() / scale };
+}
+
+//==============================================================================
+void NebulaComponent::rebuildPointsLayer()
+{
+    layerDirty = false;
+    const int w = getWidth(), h = getHeight();
+    if (w <= 0 || h <= 0)
+        return;
+
+    const float scale = juce::Component::getApproximateScaleFactorForComponent (this);
+    pointsLayer = juce::Image (juce::Image::ARGB, juce::roundToInt (w * scale), juce::roundToInt (h * scale), true);
+    juce::Graphics g (pointsLayer);
+    g.addTransform (juce::AffineTransform::scale (scale));
+
+    using namespace LatentPalette;
+
+    // Dot grid
+    g.setColour (juce::Colour (0xff1a1a30));
+    for (float gx = 14.0f; gx < (float) w; gx += 28.0f)
+        for (float gy = 14.0f; gy < (float) h; gy += 28.0f)
+            g.fillRect (gx, gy, 1.0f, 1.0f);
+
+    if (map == nullptr)
+        return;
+
+    // Points: faint halo + core. Plain circles keep this fast for large maps.
+    const float r = juce::jlimit (1.5f, 3.5f, 1.5f + std::log2 (zoom));
+    const auto halo = accentCyan().withAlpha (0.10f);
+    const auto core = accentCyan().withAlpha (0.70f);
+    const auto bounds = getLocalBounds().toFloat().expanded (10.0f);
+
+    for (const auto& p : map->points)
+    {
+        const auto s = mapToScreen (p.x, p.y);
+        if (! bounds.contains (s))
+            continue;
+        g.setColour (halo);
+        g.fillEllipse (s.x - r * 3.0f, s.y - r * 3.0f, r * 6.0f, r * 6.0f);
+        g.setColour (core);
+        g.fillEllipse (s.x - r, s.y - r, r * 2.0f, r * 2.0f);
+    }
+}
+
+void NebulaComponent::paint (juce::Graphics& g)
+{
+    using namespace LatentPalette;
+    const auto bounds = getLocalBounds().toFloat();
+
+    g.fillAll (darkBg());
+    if (layerDirty)
+        rebuildPointsLayer();
+    g.drawImage (pointsLayer, bounds);
+
+    if (map != nullptr && ! map->points.empty())
+    {
+        const auto c = mapToScreen (cursorX, cursorY);
+
+        // Blend lines: which sounds the current position mixes, and how much.
+        for (size_t i = 0; i < neighbours.size(); ++i)
+        {
+            const auto& p = map->points[(size_t) neighbours[i]];
+            const auto s = mapToScreen (p.x, p.y);
+            const float w = neighbourWeights[i];
+            g.setColour (accentAmber().withAlpha (0.15f + 0.6f * w));
+            g.drawLine (c.x, c.y, s.x, s.y, 0.6f + 1.6f * w);
+            g.setColour (accentAmber().withAlpha (0.35f + 0.65f * w));
+            const float rr = 2.5f + 3.0f * w;
+            g.fillEllipse (s.x - rr, s.y - rr, rr * 2.0f, rr * 2.0f);
+        }
+
+        // Hovered point
+        if (hoverIndex >= 0 && hoverIndex < (int) map->points.size())
+        {
+            const auto& p = map->points[(size_t) hoverIndex];
+            const auto s = mapToScreen (p.x, p.y);
+            g.setColour (textPrimary());
+            g.drawEllipse (s.x - 6.0f, s.y - 6.0f, 12.0f, 12.0f, 1.2f);
+
+            const auto label = p.label.isNotEmpty() ? p.label : ("Sound " + juce::String (hoverIndex + 1));
+            g.setFont (juce::FontOptions (12.0f));
+            auto box = juce::Rectangle<float> (s.x + 10.0f, s.y - 22.0f,
+                                               juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), label) + 12.0f, 18.0f);
+            box = box.constrainedWithin (bounds.reduced (4.0f));
+            g.setColour (panelBg().withAlpha (0.92f));
+            g.fillRoundedRectangle (box, 4.0f);
+            g.setColour (textPrimary());
+            g.drawText (label, box, juce::Justification::centred, false);
+        }
+
+        // Cursor
+        constexpr float ringR = 9.0f, lineIn = 12.0f, lineOut = 20.0f;
+        g.setColour (accentAmber().withAlpha (0.18f));
+        g.fillEllipse (c.x - 18.0f, c.y - 18.0f, 36.0f, 36.0f);
+        g.setColour (accentAmber());
+        g.drawEllipse (c.x - ringR, c.y - ringR, ringR * 2.0f, ringR * 2.0f, 1.5f);
+        g.drawLine (c.x, c.y - lineOut, c.x, c.y - lineIn, 1.5f);
+        g.drawLine (c.x, c.y + lineIn, c.x, c.y + lineOut, 1.5f);
+        g.drawLine (c.x - lineOut, c.y, c.x - lineIn, c.y, 1.5f);
+        g.drawLine (c.x + lineIn, c.y, c.x + lineOut, c.y, 1.5f);
+        g.fillEllipse (c.x - 2.0f, c.y - 2.0f, 4.0f, 4.0f);
+
+        // Hint
+        g.setFont (juce::FontOptions (10.5f));
+        g.setColour (textSecondary().withAlpha (0.6f));
+        g.drawText ("click: play   right-drag: pan   wheel: zoom   double-click: reset",
+                    bounds.reduced (8.0f, 4.0f), juce::Justification::bottomRight, false);
     }
 
-    auto pt = screenToMap ((float) event.x, (float) event.y);
-    
+    if (overlay.isNotEmpty())
+    {
+        g.setFont (juce::FontOptions (15.0f));
+        g.setColour (overlayIsError ? juce::Colour (0xfff06080) : textSecondary());
+        g.drawFittedText (overlay, getLocalBounds().reduced (40), juce::Justification::centred, 3);
+    }
+
+    g.setColour (borderCol());
+    g.drawRect (bounds, 1.0f);
+}
+
+//==============================================================================
+bool NebulaComponent::isPanGesture (const juce::MouseEvent& e) const
+{
+    return e.mods.isRightButtonDown() || e.mods.isMiddleButtonDown();
+}
+
+void NebulaComponent::pickAt (juce::Point<float> screenPos, bool isDrag)
+{
+    if (map == nullptr || map->points.empty())
+        return;
+
+    auto pt = screenToMap (screenPos.x, screenPos.y);
+    pt.x = juce::jlimit (map->minX, map->maxX, pt.x);
+    pt.y = juce::jlimit (map->minY, map->maxY, pt.y);
+
     if (isSnapping)
     {
-        const auto* nearest = soundMap.getNearestPoint (pt.x, pt.y);
-        if (nearest != nullptr)
-        {
-            cursorX = nearest->x;
-            cursorY = nearest->y;
-        }
-        else
-        {
-            // Fallback if map is empty
-            cursorX = pt.x;
-            cursorY = pt.y;
-        }
+        const int idx = map->nearestIndex (pt.x, pt.y);
+        if (idx >= 0)
+            pt = { map->points[(size_t) idx].x, map->points[(size_t) idx].y };
     }
-    else
-    {
-        cursorX = pt.x;
-        cursorY = pt.y;
-    }
+
+    cursorX = pt.x;
+    cursorY = pt.y;
+    updateNeighbours();
+    repaint();
 
     if (onCursorChanged)
-        onCursorChanged (cursorX, cursorY);
-
-    repaint();
+        onCursorChanged (cursorX, cursorY, isDrag);
 }
 
-void NebulaComponent::mouseDrag (const juce::MouseEvent& event)
+void NebulaComponent::mouseDown (const juce::MouseEvent& e)
 {
-    if (event.mods.isRightButtonDown() || event.mods.isMiddleButtonDown())
+    if (isPanGesture (e))
     {
-        float w = (float) getWidth();
-        float h = (float) getHeight();
-        
-        float mapW = soundMap.getMaxX() - soundMap.getMinX();
-        float mapH = soundMap.getMaxY() - soundMap.getMinY();
+        isPanning = true;
+        panStartX = panX;
+        panStartY = panY;
+        return;
+    }
+    pickAt (e.position, false);
+}
 
-        // Calculate delta in Map Coordinates
-        // Invert X because moving mouse Right should move View Left (Pan)
-        // Or wait, dragging map: Move mouse right -> map moves right.
-        // Center moves left.
-        
-        // Delta Screen
-        float dxScreen = (float) event.getDistanceFromDragStartX();
-        float dyScreen = (float) event.getDistanceFromDragStartY();
-
-        // Screen to Map Ratio
-        float scaleX = mapW / w / zoomFactor;
-        float scaleY = mapH / h / zoomFactor;
-
-        // Apply to start pos
-        // Note: dyScreen positive is Down.
-        // Moving mouse Down -> Map moves Down -> Center moves Up (Negative Y direction in Map)
-        // Since Y is NOT inverted anymore (Positive Y = Down), dragging Down should DECREASE panY 
-        // to move the viewport Center Up (so the Map moves Down).
-        
-        panX = startPanX - dxScreen * scaleX;
-        panY = startPanY - dyScreen * scaleY; // Sign flipped for non-inverted Y
-
+void NebulaComponent::mouseDrag (const juce::MouseEvent& e)
+{
+    if (isPanning)
+    {
+        if (map == nullptr)
+            return;
+        const float scale = zoom * 0.94f;
+        panX = panStartX - (float) e.getDistanceFromDragStartX() / (float) getWidth() * map->rangeX() / scale;
+        panY = panStartY - (float) e.getDistanceFromDragStartY() / (float) getHeight() * map->rangeY() / scale;
+        layerDirty = true;
         repaint();
         return;
     }
-
-    mouseDown (event);
+    pickAt (e.position, true);
 }
 
-void NebulaComponent::mouseUp (const juce::MouseEvent& event)
+void NebulaComponent::mouseUp (const juce::MouseEvent&)
 {
+    if (isPanning)
+    {
+        isPanning = false;
+        return;
+    }
     if (onMouseReleased)
         onMouseReleased();
 }
 
-void NebulaComponent::mouseExit (const juce::MouseEvent& event)
+void NebulaComponent::mouseMove (const juce::MouseEvent& e)
 {
-    // If mouse leaves the component, we should probably trigger release too?
-    // User might want to drag outside though.
-    // Standard VST behavior: Dragging outside usually keeps control.
-    // But if button is released outside, mouseUp is called globally by JUCE.
-    // So we don't need to do anything here strictly.
-    // However, if we want to stop playing when cursor leaves the area (XY Pad style),
-    // we would call release here.
-    // Let's stick to Button Up logic for now.
-}
-
-void NebulaComponent::mouseWheelMove (const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
-{
-    (void)event; // Suppress unreferenced parameter warning
-    float zoomDelta = (wheel.deltaY > 0) ? 1.1f : 0.9f;
-    float newZoom = juce::jlimit (1.0f, 50.0f, zoomFactor * zoomDelta);
-
-    if (newZoom != zoomFactor)
+    int newHover = -1;
+    if (map != nullptr && ! map->points.empty())
     {
-        // To zoom towards crosshair:
-        // We want cursorX, cursorY to remain at the same relative screen position?
-        // Actually, prompt says "when zooming in we focus on the crosshair".
-        // This implies we should center the view on the cursorX, cursorY.
-        
-        // Let's implement panning such that the crosshair remains centered or we move towards it.
-        // Simple approach: Center the view on the crosshair as we zoom in.
-        
-        if (newZoom > zoomFactor) // Zooming In
+        const auto pt = screenToMap (e.position.x, e.position.y);
+        const int idx = map->nearestIndex (pt.x, pt.y);
+        if (idx >= 0)
         {
-            // Drift pan towards cursor
-            float drift = 0.1f; // Amount to drift per step
-            panX += (cursorX - panX) * drift;
-            panY += (cursorY - panY) * drift;
+            const auto s = mapToScreen (map->points[(size_t) idx].x, map->points[(size_t) idx].y);
+            if (s.getDistanceFrom (e.position) <= kHoverRadius)
+                newHover = idx;
         }
-
-        zoomFactor = newZoom;
+    }
+    if (newHover != hoverIndex)
+    {
+        hoverIndex = newHover;
         repaint();
     }
 }
 
-juce::Point<float> NebulaComponent::mapToScreen (float x, float y) const
+void NebulaComponent::mouseExit (const juce::MouseEvent&)
 {
-    auto w = (float) getWidth();
-    auto h = (float) getHeight();
-
-    if (w <= 0.0f || h <= 0.0f)
-        return juce::Point<float> (0.0f, 0.0f);
-
-    float minX = soundMap.getMinX();
-    float maxX = soundMap.getMaxX();
-    float minY = soundMap.getMinY();
-    float maxY = soundMap.getMaxY();
-
-    float mapW = maxX - minX;
-    float mapH = maxY - minY;
-
-    // Guard against degenerate map bounds
-    const float eps = 1.0e-6f;
-    if (std::abs(mapW) < eps) mapW = 1.0f;
-    if (std::abs(mapH) < eps) mapH = 1.0f;
-
-    // Apply Pan
-    // We treat panX/panY as the center of the view in map coordinates
-    // If panX=0, panY=0 (default), we might be at origin.
-    // Ideally default view should be centered on map center.
-    // Let's adjust pan behavior:
-    // panX/Y is the offset from the map center.
-
-    float centerX = minX + mapW * 0.5f + panX;
-    float centerY = minY + mapH * 0.5f + panY;
-
-    // Normalize relative to view center and zoom
-    // (val - center) * zoom / size + 0.5
-
-    float normX = (x - centerX) / mapW * zoomFactor + 0.5f;
-    float normY = (y - centerY) / mapH * zoomFactor + 0.5f;
-
-    // Invert Y so positive is up? NO.
-    // Python GUI uses Y-Down (Screen Coordinates).
-    // To match Python, we DO NOT invert Y.
-    // High Y value = Bottom of screen.
-    return juce::Point<float> (normX * w, normY * h);
+    if (hoverIndex >= 0)
+    {
+        hoverIndex = -1;
+        repaint();
+    }
 }
 
-juce::Point<float> NebulaComponent::screenToMap (float x, float y) const
+void NebulaComponent::mouseDoubleClick (const juce::MouseEvent&)
 {
-    auto w = (float) getWidth();
-    auto h = (float) getHeight();
+    resetView();
+}
 
-    if (w <= 0.0f || h <= 0.0f)
-        return juce::Point<float> (0.0f, 0.0f);
+void NebulaComponent::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
+{
+    if (map == nullptr || wheel.deltaY == 0.0f)
+        return;
 
-    float minX = soundMap.getMinX();
-    float maxX = soundMap.getMaxX();
-    float minY = soundMap.getMinY();
-    float maxY = soundMap.getMaxY();
+    const float newZoom = juce::jlimit (1.0f, 50.0f, zoom * (wheel.deltaY > 0.0f ? 1.15f : 1.0f / 1.15f));
+    if (newZoom == zoom)
+        return;
 
-    float mapW = maxX - minX;
-    float mapH = maxY - minY;
+    // Keep the map point under the mouse fixed while zooming.
+    const auto anchor = screenToMap (e.position.x, e.position.y);
+    zoom = newZoom;
+    const float scale = zoom * 0.94f;
+    const float cx = anchor.x - (e.position.x / (float) getWidth() - 0.5f) * map->rangeX() / scale;
+    const float cy = anchor.y - (e.position.y / (float) getHeight() - 0.5f) * map->rangeY() / scale;
+    panX = cx - (map->minX + map->rangeX() * 0.5f);
+    panY = cy - (map->minY + map->rangeY() * 0.5f);
+    if (zoom <= 1.0f)
+        panX = panY = 0.0f;
 
-    // Guard against degenerate map bounds
-    const float eps = 1.0e-6f;
-    if (std::abs(mapW) < eps) mapW = 1.0f;
-    if (std::abs(mapH) < eps) mapH = 1.0f;
-
-    float centerX = minX + mapW * 0.5f + panX;
-    float centerY = minY + mapH * 0.5f + panY;
-
-    float normX = x / w;
-    float normY = y / h; // No inversion to match Python
-
-    // Inverse of mapToScreen:
-    // norm = (val - center) / mapSize * zoom + 0.5
-    // norm - 0.5 = (val - center) / mapSize * zoom
-    // (norm - 0.5) / zoom * mapSize = val - center
-    // val = center + (norm - 0.5) * mapSize / zoom
-
-    return juce::Point<float> (
-        centerX + (normX - 0.5f) * mapW / zoomFactor,
-        centerY + (normY - 0.5f) * mapH / zoomFactor
-    );
+    layerDirty = true;
+    repaint();
 }

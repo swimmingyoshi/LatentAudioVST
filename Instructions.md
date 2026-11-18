@@ -1,47 +1,42 @@
-WHEN MODEL IS LOADED, USES AROUND 3GB OF MEMORY TO STORE MODEL.
+LatentAudioVST - quick guide
 
-USES GPU (CUDA, THEN DIRECTML) WHEN AVAILABLE, OTHERWISE CPU. THE ACTIVE PROVIDER IS SHOWN IN THE UI.
+SETUP
+- Add the LatentAudioVST.vst3 folder to your VST3 plugins folder and rescan in your DAW (FL: scan in the plugin manager).
+- Load a model: click "Load Model..." and pick the model folder (e.g. KickModel),
+  or just DRAG THE FOLDER ONTO THE PLUGIN.
+  The folder needs an ONNX model (.onnx) and a sound map (.json, preferably sound_map.json).
+- Loading happens in the background. A large model takes a few seconds and uses a lot of memory
+  (about 1-3 GB). Several instances using the same model share one copy.
+- Uses the GPU (CUDA, then DirectML) when available, otherwise the CPU. The header shows which.
 
-Vst3 folder comes with ONNX CPU runtime in the package. 
-- Add the LatentAudioVST.vst3 folder to your vst plugins.
+PLAYING
+- Click the map to play a sound, drag to morph between sounds while it plays.
+- Orange lines show which sounds the cursor is blending (thicker = stronger).
+- Right/middle drag pans, mouse wheel zooms toward the mouse, double-click resets the view.
+- Hover a dot to see its name.
 
-- scan in fl to find plugin
+BUTTONS
+- PLAY ON NOTE: only MIDI notes play sounds. Moving the cursor (or automating it) changes the sound
+  without playing it, so muting your MIDI pattern really makes it silent.
+- HOLD: loops the Start-End region until you let go / the note ends. Turning Hold off lets it finish.
+- SNAP: the cursor snaps to the nearest sound.
+- KEY TRACK: MIDI notes transpose the sound. The ROOT knob is the note that plays at original pitch.
+- RANDOM: jumps to a random sound.
+- CENTER: resets the view and puts the cursor in the middle of the map.
+- RESET: puts all knobs back to default (keeps the position).
+- Double-click any knob to reset just that knob.
 
-- Click Load Model Folder, and Select the KickModel folder.
+AUTOMATION
+- Position X / Position Y are automatable (Y = 1 is the top of the map). Dragging on the map
+  records automation if your DAW is recording automation.
+- The hidden "Inference Rate" parameter limits how often automated movement re-generates the
+  sound (0 = as fast as possible). Find it in FL's "Browse parameters".
 
-This folder should contain 2 things. An ONNX model, and a .json File for the sound map
+EXPORTING
+- During export (offline render) the plugin generates synchronously, so exports are deterministic.
+  Large models on CPU can make exports slower than real time; recording the track live is an
+  alternative.
 
-Model will be loaded onto memory, and can be used for multiple instances of the plugin
-
-- Hold = loops sound
-
-- Snap = WHEN TURNED ON THE CROSSHAIR SNAPS TO NEAREST POINT INSTEAD
-
-- PLAY ON NOTE = PROBABLY THE ONE YOULL USE MOST WITH MIDI/NOTE INPUT.
-
-- RANDOM BUTTON = PLACES CROSSHAIR IN RANDOM LOCATION
-- HOME = RECENTERS EVERYTHING, SCREEN AND CROSSHAIR
-- RESET SETTINGS = RESETS SETTINGS TO A DEFAULT. (MIGHT BE DIFFERENT THAN STARTUP ILL HAVE TO DOUBLE CHECK LATER)
-
-TIPS:
-
-USE PLAY ON NOTE TO CONTROL WHEN SOUNDS ARE PLAYED.
-
-MUTE BOTH PATTERN AND AUTOMATION CLIPS IN PLAYLIST OR CHANNEL RACK TO STOP PLUGIN FROM PLAYING SOUND.
-
-REASON:
-- WHEN MUTING MIDI NOTE IT STILL PLAYS A SINGLE AUTOMATED SOUND
-- WHEN MUTING AUTOMATION IT STILL PLAYS ON NOTE
-(WILL PROBABLY JUST REMOVE THE DEFAULT SOUND PLAY LATER IF THIS IS A BIG PROBLEM)
-
-EXPORT MIGHT NOT SOUND EXACTLY AS THE DAW PLAYBACK
-FOR NOW I SUGGEST RECORDING YOUR TRACK FOR EXACT PLAYBACK 
-
-ALSO PLUGIN INFERENCE DURING EXPORT MIGHT SLOW DOWN THE EXPORTING PROCESS BY ALOT (5X-10X). SO ITS REALLY RECOMMENDED TO JUST RECORD YOUR TRACK IN FL AND EXPORT WITH THAT INSTEAD OF THE PLUGIN.
-
-INCASE YOU WANTED MORE CONTROL DURING AUTOMATION.
-
-THERE ARE HIDDEN PARAMETERS TO CONTROL THE X AND Y POSITION OF THE CROSSHAIR. ALONG WITH A HIDDEN PARAMETER TO CONTROL THE RATE OF INFERENCE. (YOU CAN FIND IT IN BROWSE PARAMETERS WINDOW IN FL)
-
-THE HIDDEN inferenceRate PARAMETER CONTROLS HOW OFTEN AUTOMATED POSITION CHANGES RE-RUN INFERENCE.
-(THE OLD MORPH AND ADSR CONTROLS WERE REMOVED; AUTOMATE POSITION X/Y INSTEAD.)
+PROJECTS
+- The current sound is saved in the project, so it still plays on a machine without the model.
+  Load the model folder there to explore again.

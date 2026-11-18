@@ -1,0 +1,663 @@
+#include "TestHelpers.h"
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
+
+using namespace TestHelpers;
+
+namespace
+{
+    struct TimedMidi
+    {
+        int sample;
+        juce::MidiMessage message;
+    };
+
+    // Drives a processor like a host would.
+    struct Rig
+    {
+        LatentAudioVSTAudioProcessor proc;
+        double sampleRate;
+        int blockSize;
+        int channels;
+
+        explicit Rig (double sr = 44100.0, int block = 512, int numChannels = 2)
+            : sampleRate (sr), blockSize (block), channels (numChannels)
+        {
+            proc.prepareToPlay (sr, block);
+        }
+
+        std::vector<float> render (int numSamples, std::vector<TimedMidi> events = {})
+        {
+            std::vector<float> out;
+            out.reserve ((size_t) numSamples);
+            juce::AudioBuffer<float> buffer (channels, blockSize);
+            for (int done = 0; done < numSamples; done += blockSize)
+            {
+                const int n = std::min (blockSize, numSamples - done);
+                buffer.setSize (channels, n, false, false, true);
+                juce::MidiBuffer midi;
+                for (auto& e : events)
+                    if (e.sample >= done && e.sample < done + n)
+                        midi.addEvent (e.message, e.sample - done);
+                proc.processBlock (buffer, midi);
+                for (int i = 0; i < n; ++i)
+                    out.push_back (buffer.getSample (0, i));
+                if (channels > 1)
+                    for (int i = 0; i < n; ++i)
+                        jassert (buffer.getSample (1, i) == buffer.getSample (0, i));
+            }
+            return out;
+        }
+
+        void set (const juce::String& id, float plainValue)
+        {
+            auto* p = proc.getAPVTS().getParameter (id);
+            p->setValueNotifyingHost (p->convertTo0to1 (plainValue));
+        }
+
+        float get (const juce::String& id) { return proc.getAPVTS().getRawParameterValue (id)->load(); }
+
+        // Hands `audio` to the player and starts it like a click on the map would.
+        void playAudio (std::vector<float> audio)
+        {
+            proc.injectDecodedAudio (std::move (audio));
+            proc.triggerFromUI (0.0f, 0.0f);
+        }
+    };
+
+    bool allFinite (const std::vector<float>& x)
+    {
+        return std::all_of (x.begin(), x.end(), [] (float v) { return std::isfinite (v); });
+    }
+
+    float maxStep (const std::vector<float>& x)
+    {
+        float m = 0.0f;
+        for (size_t i = 1; i < x.size(); ++i)
+            m = std::max (m, std::abs (x[i] - x[i - 1]));
+        return m;
+    }
+
+    void pumpMessages (int ms)
+    {
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (ms);
+    }
+}
+
+//==============================================================================
+class PlaybackTests : public juce::UnitTest
+{
+public:
+    PlaybackTests() : juce::UnitTest ("Playback", "LatentAudio") {}
+
+    void runTest() override
+    {
+        beginTest ("pitch and length are correct at 48 kHz (model is 44.1 kHz)");
+        {
+            Rig r (48000.0);
+            r.playAudio (sine (1000.0, 44100.0, 44100));
+            auto out = r.render (52000);
+            const double f = measureFrequency (out, 2400, 40000, 48000.0);
+            expectWithinAbsoluteError (f, 1000.0, 3.0);
+            expect (rms (out, 46000, 47500) > 0.1f, "still playing just before 1 s");
+            expectLessThan (peak (out, 48700, 52000), 1.0e-3f);
+        }
+
+        beginTest ("pitch is correct at 44.1 kHz and 96 kHz");
+        for (double sr : { 44100.0, 96000.0 })
+        {
+            Rig r (sr);
+            r.playAudio (sine (1000.0, 44100.0, 44100));
+            auto out = r.render ((int) (sr * 0.5));
+            expectWithinAbsoluteError (measureFrequency (out, (int) (sr * 0.05), (int) (sr * 0.45), sr), 1000.0, 3.0);
+        }
+
+        beginTest ("mono output bus does not crash and plays");
+        {
+            Rig r (44100.0, 512, 1);
+            r.playAudio (sine (440.0, 44100.0, 44100));
+            expect (rms (r.render (8192), 0, 8192) > 0.1f);
+        }
+
+        beginTest ("MIDI note-on is sample accurate");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.proc.injectDecodedAudio (std::vector<float> (44100, 0.5f));
+            r.render (512);
+            auto out = r.render (512, { { 300, juce::MidiMessage::noteOn (1, 60, 1.0f) } });
+            expectEquals (peak (out, 0, 300), 0.0f);
+            expect (rms (out, 320, 512) > 0.3f);
+        }
+
+        beginTest ("note-off only releases the note that is sounding");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            r.render (512);
+            auto out = r.render (4000, { { 0, juce::MidiMessage::noteOn (1, 60, 1.0f) },
+                                         { 100, juce::MidiMessage::noteOn (1, 64, 1.0f) },
+                                         { 200, juce::MidiMessage::noteOff (1, 60) } });
+            expect (rms (out, 3000, 4000) > 0.1f, "note 64 still holds the voice");
+            out = r.render (4000, { { 0, juce::MidiMessage::noteOff (1, 64) } });
+            expectLessThan (peak (out, 2000, 4000), 1.0e-3f);
+        }
+
+        beginTest ("Play on Note: moving the position does not make a sound");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("positionX", 0.3f);
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            expectEquals (peak (r.render (4800)), 0.0f);
+
+            r.set ("triggerOnMidi", 0.0f);
+            r.set ("positionX", 0.6f); // free mode: moving auditions
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            expect (rms (r.render (4800), 0, 4800) > 0.1f);
+        }
+
+        beginTest ("Key Track transposes relative to the root note");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("keyTrack", 1.0f);
+            r.set ("rootNote", 60.0f);
+            r.proc.injectDecodedAudio (sine (500.0, 44100.0, 44100));
+            r.render (512);
+            auto up = r.render (20000, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
+            expectWithinAbsoluteError (measureFrequency (up, 1000, 19000, 44100.0), 1000.0, 5.0);
+            auto down = r.render (30000, { { 0, juce::MidiMessage::noteOn (1, 48, 1.0f) } });
+            expectWithinAbsoluteError (measureFrequency (down, 2000, 29000, 44100.0), 250.0, 2.0);
+        }
+
+        beginTest ("velocity sensitivity scales level");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("velocitySens", 1.0f);
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            r.render (512);
+            auto loud = r.render (4096, { { 0, juce::MidiMessage::noteOn (1, 60, 1.0f) } });
+            auto soft = r.render (4096, { { 0, juce::MidiMessage::noteOn (1, 60, 0.5f) } });
+            expectWithinAbsoluteError (rms (soft, 1000, 4000) / rms (loud, 1000, 4000), 0.5f, 0.03f);
+        }
+
+        beginTest ("Hold loops until switched off");
+        {
+            Rig r;
+            r.set ("latchMode", 1.0f);
+            r.set ("sampleLength", 0.5f);
+            r.playAudio (sine (440.0, 44100.0, 44100));
+            r.proc.releaseFromUI();
+            auto out = r.render (44100 * 3);
+            expect (rms (out, 44100 * 2, 44100 * 3) > 0.1f);
+            r.set ("latchMode", 0.0f);
+            out = r.render (4096);
+            expectLessThan (peak (out, 2048, 4096), 1.0e-3f);
+        }
+
+        beginTest ("Start past End still plays (was silent)");
+        {
+            Rig r;
+            r.set ("sampleStart", 0.9f);
+            r.set ("sampleLength", 0.1f);
+            r.playAudio (sine (440.0, 44100.0, 44100));
+            expect (rms (r.render (2048), 0, 2048) > 0.05f);
+        }
+
+        beginTest ("new sound crossfades in without jumps");
+        {
+            Rig r;
+            r.playAudio (sine (1000.0, 44100.0, 44100));
+            auto a = r.render (4410);
+            r.proc.injectDecodedAudio (sine (500.0, 44100.0, 44100));
+            auto b = r.render (22050);
+            a.insert (a.end(), b.begin(), b.end());
+            expectLessThan (maxStep (a), 0.15f);
+            expectWithinAbsoluteError (measureFrequency (b, 8000, 22000, 44100.0), 500.0, 3.0);
+        }
+
+        beginTest ("retriggering mid-sound is declicked");
+        {
+            Rig r;
+            r.playAudio (std::vector<float> (44100, 0.5f));
+            auto a = r.render (4000);
+            r.proc.triggerFromUI (0.0f, 0.0f);
+            auto b = r.render (4000);
+            a.insert (a.end(), b.begin(), b.end());
+            expectLessThan (maxStep (a), 0.05f);
+        }
+
+        beginTest ("dragging keeps the voice playing (no restart per mouse move)");
+        {
+            Rig r;
+            r.playAudio (sine (440.0, 44100.0, 44100));
+            r.render (8820);
+            const float before = r.proc.getPlayheadNormalized();
+            for (int i = 0; i < 10; ++i)
+            {
+                r.proc.triggerFromUI (0.01f * (float) i, 0.0f, false);
+                r.render (256);
+            }
+            expect (r.proc.getPlayheadNormalized() > before, "playhead kept advancing");
+        }
+
+        beginTest ("a quick click plays the whole one-shot");
+        {
+            Rig r;
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 22050));
+            r.proc.triggerFromUI (0.0f, 0.0f);
+            r.proc.releaseFromUI(); // mouse up before the first audio block
+            auto out = r.render (26000);
+            expect (rms (out, 19000, 21500) > 0.1f, "still sounding near the end of the sample");
+            expectLessThan (peak (out, 23500, 26000), 1.0e-3f);
+        }
+
+        beginTest ("filter: stable at full resonance, correct response at zero");
+        {
+            Rig r;
+            r.set ("latchMode", 1.0f);
+            r.set ("filterResonance", 1.0f);
+            juce::Random rng (42);
+            std::vector<float> noise (44100);
+            for (auto& s : noise) s = rng.nextFloat() - 0.5f;
+            r.playAudio (noise);
+            std::vector<float> all;
+            for (int i = 0; i < 80; ++i)
+            {
+                r.set ("filterCutoff", 20.0f * std::pow (1000.0f, (float) i / 79.0f));
+                auto o = r.render (512);
+                all.insert (all.end(), o.begin(), o.end());
+            }
+            expect (allFinite (all));
+            expectLessThan (peak (all), 10.0f);
+
+            Rig lp;
+            lp.set ("latchMode", 1.0f);
+            lp.set ("filterCutoff", 1000.0f);
+            lp.playAudio (sine (100.0, 44100.0, 44100));
+            auto low = lp.render (16384);
+            Rig hp;
+            hp.set ("latchMode", 1.0f);
+            hp.set ("filterCutoff", 1000.0f);
+            hp.playAudio (sine (10000.0, 44100.0, 44100));
+            auto high = hp.render (16384);
+            expectWithinAbsoluteError (rms (low, 4000, 16000), 0.3535f, 0.03f);
+            expectLessThan (rms (high, 4000, 16000), 0.0035f); // > 40 dB down
+        }
+
+        beginTest ("unloading silences and clears the sound");
+        {
+            Rig r;
+            r.playAudio (sine (440.0, 44100.0, 44100));
+            r.render (2048);
+            expect (r.proc.hasAudio());
+            r.proc.unloadModel();
+            auto out = r.render (2048);
+            expectEquals (peak (out), 0.0f);
+            expect (! r.proc.hasAudio());
+        }
+    }
+};
+
+//==============================================================================
+class StateTests : public juce::UnitTest
+{
+public:
+    StateTests() : juce::UnitTest ("State", "LatentAudio") {}
+
+    void runTest() override
+    {
+        beginTest ("save / restore round trip");
+        {
+            Rig a;
+            a.set ("playbackRate", 1.5f);
+            a.set ("outputGain", 0.5f);
+            a.set ("keyTrack", 1.0f);
+            a.proc.triggerFromUI (0.25f, -0.5f);
+            a.proc.releaseFromUI();
+            a.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            a.render (512);
+
+            juce::MemoryBlock state;
+            a.proc.getStateInformation (state);
+            expectLessThan ((int) state.getSize(), 300 * 1024); // was ~1 MB (2 buffers x 2 channels)
+
+            Rig b;
+            b.proc.setStateInformation (state.getData(), (int) state.getSize());
+            b.render (512);
+            expect (b.proc.hasAudio());
+            expectWithinAbsoluteError (b.get ("playbackRate"), 1.5f, 1.0e-4f);
+            expectWithinAbsoluteError (b.get ("outputGain"), 0.5f, 1.0e-4f);
+            expectEquals (b.get ("keyTrack"), 1.0f);
+            expectEquals (b.proc.getCursor().x, 0.25f);
+            expectEquals (b.proc.getCursor().y, -0.5f);
+            std::vector<float> wave;
+            b.proc.copyDisplayWaveform (wave);
+            expectEquals ((int) wave.size(), 44100);
+        }
+
+        beginTest ("loads version-1 project state (old buffer format, missing model)");
+        {
+            Rig a;
+            auto tree = a.proc.getAPVTS().copyState();
+            std::vector<float> samples (1000, 0.25f);
+            juce::MemoryBlock mb (samples.data(), samples.size() * sizeof (float));
+            tree.setProperty ("hasValidAudio", true, nullptr);
+            tree.setProperty ("activeBufferIndex", 1, nullptr);
+            tree.setProperty ("buffer1_samples", 1000, nullptr);
+            tree.setProperty ("buffer1_ch0", mb.toBase64Encoding(), nullptr);
+            tree.setProperty ("modelPath", "C:/definitely/not/here/latent_decoder.onnx", nullptr);
+            tree.setProperty ("currentX", 0.1f, nullptr);
+            juce::MemoryBlock state;
+            a.proc.copyXmlToBinary (*tree.createXml(), state);
+
+            Rig b;
+            b.proc.setStateInformation (state.getData(), (int) state.getSize());
+            b.render (512);
+            expect (b.proc.hasAudio());
+            expectEquals (b.proc.getCursor().x, 0.1f);
+            const auto status = b.proc.getLoadStatus();
+            expect (status.state == LatentAudioVSTAudioProcessor::LoadState::Failed);
+            expect (status.message.contains ("not found"), status.message);
+        }
+
+        beginTest ("garbage state is ignored");
+        {
+            Rig r;
+            const char junk[] = "this is not a plugin state";
+            r.proc.setStateInformation (junk, (int) sizeof (junk));
+            r.proc.setStateInformation (nullptr, 0);
+            expect (! r.proc.hasAudio());
+        }
+    }
+};
+
+//==============================================================================
+class ModelLoadTests : public juce::UnitTest
+{
+public:
+    ModelLoadTests() : juce::UnitTest ("Model loading", "LatentAudio") {}
+
+    void runTest() override
+    {
+        using LoadState = LatentAudioVSTAudioProcessor::LoadState;
+
+        beginTest ("loads the tiny model folder asynchronously and plays it");
+        Rig r;
+        r.proc.loadModelFolderAsync (tinyModelDir());
+        expect (r.proc.waitForModelLoad (15000));
+        auto status = r.proc.getLoadStatus();
+        expect (status.state == LoadState::Ready, status.message);
+        auto map = r.proc.getMapSnapshot();
+        expect (map != nullptr && map->points.size() == 3);
+        pumpMessages (100);
+
+        // Let the post-load priming decode land first, so the next one is ours.
+        for (int i = 0; i < 2000 && r.proc.getDisplayVersion() < 2; ++i)
+            juce::Thread::sleep (1);
+        const auto versionBefore = r.proc.getDisplayVersion();
+        r.proc.triggerFromUI (-1.0f, -1.0f); // exactly on point "a" -> latent e0
+        r.proc.releaseFromUI();
+        std::vector<float> out;
+        const auto deadline = juce::Time::getMillisecondCounter() + 5000;
+        while (juce::Time::getMillisecondCounter() < deadline)
+        {
+            auto o = r.render (512);
+            out.insert (out.end(), o.begin(), o.end());
+            if (rms (o, 0, 512) > 0.01f) break;
+            juce::Thread::sleep (1);
+        }
+        expect (r.proc.hasAudio(), "decoded audio arrived");
+        expect (rms (out, 0, (int) out.size()) > 0.01f, "and it played");
+
+        for (int i = 0; i < 5000 && r.proc.getDisplayVersion() == versionBefore; ++i)
+            juce::Thread::sleep (1);
+        expect (r.proc.getDisplayVersion() > versionBefore, "decode for the clicked point arrived");
+
+        std::vector<float> wave;
+        r.proc.copyDisplayWaveform (wave);
+        std::vector<float> e0 (kTinyLatentDim, 0.0f);
+        e0[0] = 1.0f;
+        const auto expected = tinyModelExpected (e0);
+        expectEquals ((int) wave.size(), kTinySamples);
+        if (wave.size() > 500)
+            expectWithinAbsoluteError (wave[500], expected[500], 1.0e-5f);
+
+        beginTest ("position parameters follow the cursor (Y: 1 = top)");
+        r.proc.triggerFromUI (0.0f, 0.5f);
+        r.proc.releaseFromUI();
+        expectWithinAbsoluteError (r.get ("positionX"), 0.5f, 1.0e-4f);
+        expectWithinAbsoluteError (r.get ("positionY"), 0.25f, 1.0e-4f);
+        r.set ("positionY", 1.0f);
+        expectWithinAbsoluteError (r.proc.getCursor().y, -1.0f, 1.0e-4f);
+        r.set ("positionX", 0.0f);
+        expectWithinAbsoluteError (r.proc.getCursor().x, -1.0f, 1.0e-4f);
+
+        beginTest ("a failed load reports why and keeps the current model");
+        r.proc.loadModelFolderAsync (tinyModelDir().getChildFile ("does-not-exist"));
+        expect (r.proc.waitForModelLoad (5000));
+        status = r.proc.getLoadStatus();
+        expect (status.state == LoadState::Failed);
+        expect (status.message.isNotEmpty());
+        expect (r.proc.getActiveProvider() != "None");
+        expect (r.proc.getMapSnapshot() != nullptr);
+
+        beginTest ("model / map latent size mismatch is caught");
+        juce::TemporaryFile tmpDir;
+        const auto dir = tmpDir.getFile();
+        dir.createDirectory();
+        tinyModelDir().getChildFile ("latent_decoder.onnx").copyFileTo (dir.getChildFile ("latent_decoder.onnx"));
+        dir.getChildFile ("sound_map.json").replaceWithText (
+            "{\"latent_dim\": 4, \"sample_rate\": 44100, \"points\": [{\"x\":0,\"y\":0,\"latent\":[1,0,0,0]}]}");
+        r.proc.loadModelFolderAsync (dir);
+        expect (r.proc.waitForModelLoad (5000));
+        status = r.proc.getLoadStatus();
+        expect (status.state == LoadState::Failed);
+        expect (status.message.contains ("latent size"), status.message);
+
+        beginTest ("prefers sound_map.json when a folder has several .json files");
+        dir.getChildFile ("a_config.json").replaceWithText ("{}");
+        juce::File onnx, json;
+        juce::String err;
+        expect (LatentAudioVSTAudioProcessor::findModelFiles (dir, onnx, json, err));
+        expectEquals (json.getFileName(), juce::String ("sound_map.json"));
+        expect (LatentAudioVSTAudioProcessor::findModelFiles (dir.getChildFile ("latent_decoder.onnx"), onnx, json, err));
+        dir.deleteRecursively();
+
+        beginTest ("unload frees the model");
+        r.proc.unloadModel();
+        expect (r.proc.getActiveProvider() == "None");
+        expect (r.proc.getMapSnapshot() == nullptr);
+        expect (r.proc.getLoadStatus().state == LoadState::Empty);
+    }
+};
+
+//==============================================================================
+class StressTests : public juce::UnitTest
+{
+public:
+    StressTests() : juce::UnitTest ("Thread safety stress", "LatentAudio") {}
+
+    void runTest() override
+    {
+        beginTest ("audio + inference + UI + reloads + state, concurrently");
+        Rig r (48000.0, 256);
+        r.proc.loadModelFolderAsync (tinyModelDir());
+        expect (r.proc.waitForModelLoad (15000));
+
+        std::atomic<bool> stop { false };
+        std::atomic<bool> finite { true };
+        std::atomic<int> blocks { 0 };
+        std::thread audio ([&]
+        {
+            juce::AudioBuffer<float> buffer (2, 256);
+            juce::MidiBuffer midi;
+            int n = 0;
+            while (! stop.load())
+            {
+                midi.clear();
+                if (n % 7 == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60 + n % 12, 0.8f), n % 256);
+                if (n % 11 == 0) midi.addEvent (juce::MidiMessage::noteOff (1, 60 + n % 12), 0);
+                r.proc.processBlock (buffer, midi);
+                for (int i = 0; i < 256; ++i)
+                    if (! std::isfinite (buffer.getSample (0, i))) finite = false;
+                ++n;
+                ++blocks;
+            }
+        });
+
+        juce::Random rng (7);
+        juce::MemoryBlock state;
+        for (int i = 0; i < 600; ++i)
+        {
+            const int action = rng.nextInt (100);
+            if (action < 55)       r.proc.triggerFromUI (rng.nextFloat() * 2.0f - 1.0f, rng.nextFloat() * 2.0f - 1.0f);
+            else if (action < 70)  r.proc.releaseFromUI();
+            else if (action < 80)  r.set ("positionX", rng.nextFloat());
+            else if (action < 85)  r.set ("triggerOnMidi", (float) rng.nextInt (2));
+            else if (action < 89)  r.proc.loadModelFolderAsync (tinyModelDir());
+            else if (action < 91)  r.proc.unloadModel();
+            else if (action < 95)  r.proc.getStateInformation (state);
+            else if (state.getSize() > 0) r.proc.setStateInformation (state.getData(), (int) state.getSize());
+            if (i % 50 == 0) pumpMessages (5);
+            juce::Thread::sleep (1);
+        }
+        r.proc.waitForModelLoad (15000);
+        stop = true;
+        audio.join();
+        expect (finite.load(), "all output finite");
+        expect (blocks.load() > 100);
+        logMessage ("    rendered " + juce::String (blocks.load()) + " blocks during the run");
+    }
+};
+
+//==============================================================================
+class EditorTests : public juce::UnitTest
+{
+public:
+    EditorTests() : juce::UnitTest ("Editor", "LatentAudio") {}
+
+    void runTest() override
+    {
+        beginTest ("layout works from minimum to large sizes");
+        Rig r;
+        std::unique_ptr<juce::AudioProcessorEditor> ed (r.proc.createEditor());
+        auto* editor = dynamic_cast<LatentAudioVSTAudioProcessorEditor*> (ed.get());
+        expect (editor != nullptr);
+        for (auto size : { juce::Point<int> (760, 540), juce::Point<int> (980, 700), juce::Point<int> (1800, 1200) })
+        {
+            editor->setSize (size.x, size.y);
+            expect (editor->getNebula().getHeight() >= 150,
+                    "map height at " + juce::String (size.x) + "x" + juce::String (size.y) + ": "
+                        + juce::String (editor->getNebula().getHeight()));
+        }
+
+        beginTest ("two instances keep independent UI state");
+        Rig r2;
+        std::unique_ptr<juce::AudioProcessorEditor> ed2 (r2.proc.createEditor());
+        r.proc.loadModelFolderAsync (tinyModelDir());
+        expect (r.proc.waitForModelLoad (15000));
+        pumpMessages (200);
+        expect (r2.proc.getMapSnapshot() == nullptr);
+        ed2.reset();
+        ed.reset();
+    }
+};
+
+//==============================================================================
+// Optional: set LATENTAUDIO_REAL_MODEL to an exported model folder.
+class RealModelTests : public juce::UnitTest
+{
+public:
+    RealModelTests() : juce::UnitTest ("Real model", "LatentAudio") {}
+
+    void runTest() override
+    {
+        const auto path = juce::SystemStats::getEnvironmentVariable ("LATENTAUDIO_REAL_MODEL", {});
+        beginTest ("real model end to end" + juce::String (path.isEmpty() ? " (skipped: LATENTAUDIO_REAL_MODEL not set)" : ""));
+        if (path.isEmpty())
+            return;
+
+        Rig r (48000.0);
+        auto t0 = juce::Time::getMillisecondCounterHiRes();
+        r.proc.loadModelFolderAsync (juce::File (path));
+        expect (r.proc.waitForModelLoad (300000));
+        const auto status = r.proc.getLoadStatus();
+        expect (status.state == LatentAudioVSTAudioProcessor::LoadState::Ready, status.message);
+        logMessage ("    load: " + juce::String ((juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0, 2) + " s, " + status.message);
+
+        auto map = r.proc.getMapSnapshot();
+        if (map == nullptr) return;
+
+        // Time a few decodes at different positions.
+        std::vector<double> latencies;
+        for (int k = 0; k < 5; ++k)
+        {
+            const auto& p = map->points[(size_t) (k * 37 % (int) map->points.size())];
+            const auto before = r.proc.getDisplayVersion();
+            t0 = juce::Time::getMillisecondCounterHiRes();
+            r.proc.triggerFromUI (p.x, p.y);
+            r.proc.releaseFromUI();
+            while (r.proc.getDisplayVersion() == before && juce::Time::getMillisecondCounterHiRes() - t0 < 30000)
+                juce::Thread::sleep (1);
+            latencies.push_back (juce::Time::getMillisecondCounterHiRes() - t0);
+            juce::Thread::sleep (150); // stay clear of the inference rate limit
+        }
+        std::sort (latencies.begin(), latencies.end());
+        logMessage ("    decode latency median: " + juce::String (latencies[latencies.size() / 2], 1) + " ms, max: "
+                    + juce::String (latencies.back(), 1) + " ms (" + r.proc.getActiveProvider() + ")");
+
+        auto out = r.render (48000);
+        expect (allFinite (out));
+        expect (rms (out, 0, 48000) > 0.001f, "real model produced sound");
+    }
+};
+
+static PlaybackTests playbackTests;
+static StateTests stateTests;
+static ModelLoadTests modelLoadTests;
+static StressTests stressTests;
+static EditorTests editorTests;
+static RealModelTests realModelTests;
+
+//==============================================================================
+// Renders the editor with a loaded model to PNGs (for visual review).
+int renderSnapshots (const juce::File& modelDir, const juce::File& outDir)
+{
+    Rig r (48000.0);
+    r.proc.loadModelFolderAsync (modelDir);
+    if (! r.proc.waitForModelLoad (300000))
+        return 1;
+    pumpMessages (200);
+
+    if (auto map = r.proc.getMapSnapshot())
+    {
+        const auto& p = map->points[map->points.size() / 3];
+        r.proc.triggerFromUI (p.x + 0.01f * map->rangeX(), p.y);
+        r.proc.releaseFromUI();
+    }
+    for (int i = 0; i < 400 && r.proc.getDisplayVersion() < 3; ++i)
+    {
+        r.render (512);
+        juce::Thread::sleep (5);
+    }
+    r.render (9000); // advance the playhead a little
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor (r.proc.createEditor());
+    outDir.createDirectory();
+    for (auto size : { juce::Point<int> (980, 700), juce::Point<int> (760, 540), juce::Point<int> (1400, 900) })
+    {
+        editor->setSize (size.x, size.y);
+        pumpMessages (300); // let the editor's timer poll the processor
+        auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
+        auto file = outDir.getChildFile ("editor_" + juce::String (size.x) + "x" + juce::String (size.y) + ".png");
+        file.deleteFile();
+        juce::FileOutputStream stream (file);
+        juce::PNGImageFormat().writeImageToStream (image, stream);
+        std::cout << "wrote " << file.getFullPathName() << std::endl;
+    }
+    return 0;
+}

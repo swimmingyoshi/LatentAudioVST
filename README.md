@@ -88,69 +88,59 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 
 ## User Interface
 
-### Main Components
-
-#### Nebula View (Top)
-- **Visual Map**: 2D representation of the latent space
-- **Points**: Individual audio samples positioned by similarity
-- **Cursor**: Current playback position (white circle)
-- **Navigation**: Click and drag to explore different sounds
-
-#### Waveform Display (Middle)
-- **Generated Audio**: Real-time visualization of current sound
-- **Position Indicator**: Shows playback progress through the sample
-
-#### Control Panel (Bottom)
-- **Transport Controls**: Play/pause, position scrubbing
-- **Parameter Sliders**: Audio processing controls
-- **Model Loading**: Load different audio models
+### Layout
+- **Header**: model name and status (sound count, CPU/GPU), *Load Model...* and *Unload*. You can also **drag a model folder (or its .onnx / .json) onto the plugin** to load it. Loading runs in the background, so the DAW never freezes.
+- **Toolbar**: *Play on Note*, *Hold*, *Snap*, *Key Track*, *Random*, *Center*, MIDI activity light, cursor coordinates, *Reset*.
+- **Sound map**: click/drag to play, right/middle-drag to pan, mouse wheel zooms toward the pointer, double-click resets the view. Hover a dot to see its name. Orange lines show which sounds the cursor is blending and how strongly.
+- **Waveform**: the generated sound, the Start-End region that plays, and the playhead.
+- **Knobs**: double-click any knob to reset it; hover for a description.
 
 ### Parameter Controls
 
 #### Playback
-- **Playback Rate**: Speed control (0.1x to 2.0x)
-- **Fine Tune**: Pitch adjustment (-100 to +100 cents)
+- **Rate**: playback speed (0.1x - 2.0x, also changes pitch)
+- **Tune**: fine tune (-100 to +100 cents)
+- **Loop X-Fade**: crossfade at the loop point when Hold is on
+- **Root**: with Key Track on, the MIDI note that plays at the original pitch
 
-#### Audio Processing
-- **Filter Cutoff**: Low-pass filter frequency (20Hz - 20kHz)
-- **Filter Resonance**: Filter emphasis (0.0 - 1.0)
+#### Filter
+- **Cutoff** / **Reso**: 4-pole low-pass with resonance, smoothed so automation doesn't zipper. The graph shows the real response in dB.
 
-#### Master
-- **Output Gain**: Overall volume (-∞ to +6dB)
-- **Dry/Wet Mix**: Blend between processed and unprocessed audio (0% - 100%)
-- **Sample Length**: Portion of generated audio to play (10% - 100%)
-- **Sample Start**: Starting position within the sample (0% - 90%)
+#### Output
+- **Start** / **End**: the part of the sound that plays (and loops, with Hold)
+- **Velocity**: how much MIDI velocity affects volume (0 = ignore velocity)
+- **Gain**: output level (shown in dB)
 
-#### Triggering
-- **Latch Mode**: Toggle between one-shot and sustained playback
-- **Trigger on MIDI**: Enable MIDI note triggering
-- **Snap Mode**: Quantize position to nearest sound map point
+#### Modes
+- **Play on Note**: only MIDI notes start sounds; moving the cursor or automating the position changes the sound without playing it
+- **Hold**: loop between Start and End until released (turning Hold off lets the loop finish)
+- **Snap**: snap the cursor to the nearest sound
+- **Key Track**: MIDI notes transpose the sound relative to Root
+
+#### Automation-only parameters
+- **Position X / Position Y**: cursor position (0-1, Y = 1 is the top of the map)
+- **Inference Rate**: maximum decodes per second while the position is automated (0 = unlimited)
+- **Level**: extra output level (kept for older projects)
 
 ## Features
 
 ### Real-time Exploration
-Navigate the latent space continuously, with smooth interpolation between audio samples creating organic transitions between different sounds.
+Inference runs on a background thread and always decodes the newest position, so fast drags or automation never queue up. New sounds crossfade in over 50 ms; restarting a playing note is declicked.
+
+### Correct Pitch at Any Sample Rate
+Sounds play at the model's sample rate regardless of the DAW's (44.1, 48, 96 kHz...).
 
 ### GPU Inference
 Decoding runs on CUDA or DirectML when available and falls back to CPU otherwise.
 
 ### MIDI Integration
-Trigger audio generation via MIDI notes, allowing synchronization with sequencers and musical performance.
+Sample-accurate note timing, velocity sensitivity, optional key tracking. Overlapping notes are handled legato: releasing an old note does not cut a newer one.
 
 ### Envelope
 A fixed, very short attack/release gate (1 ms / 20 ms) declicks note starts and stops; the generated sample's own shape is preserved.
 
-### Audio Processing
-Built-in 4th-order low-pass filter with resonance, applied live (changing it does not re-run inference).
-
-### Crossfading
-Seamless transitions between different positions with adjustable crossfade time to eliminate audio artifacts.
-
-### Playback Control
-Variable speed playback and fine pitch tuning for creative manipulation of the generated audio.
-
-### Model Flexibility
-Support for different ONNX models and sound maps, allowing exploration of various audio domains and styles.
+### Projects Keep Their Sound
+The current sound is saved in the project, so it still plays if the model folder is missing on another machine.
 
 ## Technical Architecture
 
@@ -232,8 +222,7 @@ Support for different ONNX models and sound maps, allowing exploration of variou
 - Check audio interface settings in your DAW
 
 #### Crackling/Popping Sounds
-- Reduce inference rate for smoother playback
-- Increase crossfade amount
+- Lower the Inference Rate parameter
 - Check for CPU overload
 
 #### Model Loading Errors
@@ -256,6 +245,17 @@ Check this file for detailed error information and troubleshooting data.
 
 ### Building
 See `AGENTS.md` for detailed build instructions using Projucer and Visual Studio.
+
+### Tests
+`Tests/` builds a console test runner from the same sources with CMake:
+
+```bash
+cmake -S Tests -B Tests/build -G "Visual Studio 17 2022" -A x64
+cmake --build Tests/build --config Release
+Tests/build/LatentAudioTests_artefacts/Release/LatentAudioTests.exe
+```
+
+They use a tiny deterministic model in `Tests/data/tiny_model` (regenerate with `Tests/tools/make_tiny_model.py`). Set `LATENTAUDIO_REAL_MODEL` to an exported model folder to also run an end-to-end test (with decode timing) on a real model.
 
 ### Model Training
 LatentAudioVST is designed to work with autoencoder-style models that compress audio into latent representations. The plugin expects:
