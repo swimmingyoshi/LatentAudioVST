@@ -13,8 +13,10 @@ If Building yourself, you need to have the onnx folder in Libs (extract either b
 
 The `.jucer` expects the JUCE `modules` folder at `../../VST_Plugins/JUCE/modules` relative to this project folder. Change the module paths in Projucer if your JUCE lives elsewhere.
 
-Once built, Onnx dlls will go into the Built VST3 folder, next to the nested vst3 file.
-`LatentAudioVST.vst3\Contents\x86_64-win\LatentAudioVST.vst3` <-- dlls here
+The build copies `onnxruntime.dll` and `onnxruntime_providers_shared.dll` into the bundle automatically:
+`LatentAudioVST.vst3\Contents_64-win\` (next to the plugin binary).
+The runtime is delay-loaded by full path from that folder, so the plugin never picks up the unrelated
+`onnxruntime.dll` that Windows 11 ships in System32, and a missing runtime shows an error instead of crashing the host.
 
 # LatentAudioVST
 
@@ -255,7 +257,11 @@ cmake --build Tests/build --config Release
 Tests/build/LatentAudioTests_artefacts/Release/LatentAudioTests.exe
 ```
 
-They use a tiny deterministic model in `Tests/data/tiny_model` (regenerate with `Tests/tools/make_tiny_model.py`). Set `LATENTAUDIO_REAL_MODEL` to an exported model folder to also run an end-to-end test (with decode timing) on a real model.
+Extra modes:
+- `LatentAudioTests.exe --host <path	o\LatentAudioVST.vst3> <modelFolder> [shot.png]` loads the built plugin like a DAW (VST3 hosting), restores a model through the plugin state, automates the position, opens the editor and checks the audio.
+- `LatentAudioTests.exe --snapshot <modelFolder> <outDir>` renders the editor to PNGs.
+
+The tests use a tiny deterministic model in `Tests/data/tiny_model` (regenerate with `Tests/tools/make_tiny_model.py`). Set `LATENTAUDIO_REAL_MODEL` to an exported model folder to also run an end-to-end test (with decode timing) on a real model.
 
 ### Model Training
 LatentAudioVST is designed to work with autoencoder-style models that compress audio into latent representations. The plugin expects:
