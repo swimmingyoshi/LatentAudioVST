@@ -17,6 +17,7 @@
 
 #include "LatentDecoder.h"
 #include "LatentLog.h"
+#include "OrtRuntime.h"
 
 std::mutex LatentDecoder::cacheMutex;
 std::map<std::string, std::weak_ptr<const LatentDecoder::Handle>> LatentDecoder::cache;
@@ -35,8 +36,38 @@ namespace
 }
 
 //==============================================================================
+bool LatentDecoder::ensureRuntime (juce::String& error)
+{
+    // Caller holds cacheMutex.
+    static bool initialised = false;
+    if (initialised)
+        return true;
+
+    std::wstring loadError, path;
+    if (! OrtRuntime::load (loadError, path))
+    {
+        error = juce::String (loadError.c_str());
+        return false;
+    }
+
+    const OrtApi* api = OrtGetApiBase()->GetApi (ORT_API_VERSION);
+    if (api == nullptr)
+    {
+        error = "onnxruntime.dll is too old (needs API version " + juce::String (ORT_API_VERSION) + ")";
+        return false;
+    }
+    Ort::InitApi (api);
+    initialised = true;
+    LatentLog::write ("[LatentDecoder] ONNX Runtime " + juce::String (OrtGetApiBase()->GetVersionString())
+                      + " loaded from " + juce::String (path.c_str()));
+    return true;
+}
+
 std::shared_ptr<const LatentDecoder::Handle> LatentDecoder::createHandle (const juce::File& file, juce::String& error)
 {
+    if (! ensureRuntime (error))
+        return nullptr;
+
     auto h = std::make_shared<Handle>();
     h->file = file;
 

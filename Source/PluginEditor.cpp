@@ -111,6 +111,8 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     unloadButton.onClick = [this] { processor.unloadModel(); };
     addAndMakeVisible (loadButton);
     addAndMakeVisible (unloadButton);
+    loadButton.setComponentID ("load");
+    unloadButton.setComponentID ("unload");
 
     // --- Toolbar ---
     addToggle (playOnNoteToggle, "triggerOnMidi", "Play on Note", "Only MIDI notes start sounds. Moving the cursor changes the sound without playing it.");
@@ -131,6 +133,9 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     resetButton.onClick = [this] { processor.resetParametersToDefaults(); };
     for (auto* b : { &randomButton, &centerButton, &resetButton })
         addAndMakeVisible (b);
+    randomButton.setComponentID ("random");
+    centerButton.setComponentID ("center");
+    resetButton.setComponentID ("reset");
 
     midiLed.setTooltip ("MIDI activity");
     addAndMakeVisible (midiLed);
@@ -142,6 +147,8 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     nebula.onMouseReleased = [this] { processor.releaseFromUI(); };
     addAndMakeVisible (nebula);
     addAndMakeVisible (waveform);
+    nebula.setComponentID ("nebula");
+    waveform.setComponentID ("waveform");
 
     // --- Knobs ---
     addKnob ("playbackRate", "Rate", "Playback speed (also changes pitch).", 0);
@@ -178,6 +185,7 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
     auto knob = std::make_unique<Knob>();
     knob->section = section;
     knob->slider.setTooltip (tooltip);
+    knob->slider.setComponentID (paramId);
     knob->slider.setPopupDisplayEnabled (false, false, nullptr);
     knob->attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), paramId, knob->slider);
@@ -201,6 +209,7 @@ void LatentAudioVSTAudioProcessorEditor::addToggle (juce::ToggleButton& button, 
 {
     button.setButtonText (text);
     button.setTooltip (tooltip);
+    button.setComponentID (paramId);
     buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), paramId, button));
     addAndMakeVisible (button);

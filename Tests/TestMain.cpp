@@ -15,6 +15,7 @@ namespace
 }
 
 int renderSnapshots (const juce::File& modelDir, const juce::File& outDir); // ProcessorTests.cpp
+int hostPlugin (const juce::File& vst3, const juce::File& modelDir, const juce::File& screenshot); // HostTests.cpp
 
 int main (int argc, char** argv)
 {
@@ -23,6 +24,10 @@ int main (int argc, char** argv)
     // LatentAudioTests --snapshot <modelFolder> <outputFolder>
     if (argc == 4 && juce::String (argv[1]) == "--snapshot")
         return renderSnapshots (juce::File (argv[2]), juce::File (argv[3]));
+
+    // LatentAudioTests --host <plugin.vst3> <modelFolder> [screenshot.png]
+    if (argc >= 4 && juce::String (argv[1]) == "--host")
+        return hostPlugin (juce::File (argv[2]), juce::File (argv[3]), argc > 4 ? juce::File (argv[4]) : juce::File());
 
     ConsoleRunner runner;
     runner.setAssertOnFailure (false);

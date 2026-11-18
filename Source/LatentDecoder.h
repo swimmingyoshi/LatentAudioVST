@@ -25,7 +25,10 @@
 #include <string>
 #include <vector>
 
-// ONNX Runtime headers (silence conversion warnings from external code)
+// ONNX Runtime headers (silence conversion warnings from external code).
+// The API is initialised explicitly once our bundled onnxruntime.dll is loaded
+// (see OrtRuntime.h), so no ORT call can happen at static-initialisation time.
+#define ORT_API_MANUAL_INIT
 #pragma warning(push)
 #pragma warning(disable: 4267)
 #pragma warning(disable: 4244)
@@ -88,6 +91,7 @@ private:
     };
 
     std::shared_ptr<const Handle> getHandle() const;
+    static bool ensureRuntime (juce::String& error);
     static std::shared_ptr<const Handle> createHandle (const juce::File& file, juce::String& error);
 
     mutable std::mutex handleMutex;

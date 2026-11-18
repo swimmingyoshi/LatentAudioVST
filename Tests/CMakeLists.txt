@@ -27,7 +27,9 @@ target_sources(LatentAudioTests PRIVATE
     SoundMapTests.cpp
     DecoderTests.cpp
     ProcessorTests.cpp
+    HostTests.cpp
     ${SRC}/LatentLog.cpp
+    ${SRC}/OrtRuntime.cpp
     ${SRC}/SoundMap.cpp
     ${SRC}/LatentDecoder.cpp
     ${SRC}/PluginProcessor.cpp
@@ -41,6 +43,7 @@ target_compile_definitions(LatentAudioTests PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_MODAL_LOOPS_PERMITTED=1
+    JUCE_PLUGINHOST_VST3=1
     JucePlugin_Name="LatentAudioVST"
     JucePlugin_IsSynth=1
     JucePlugin_WantsMidiInput=1
@@ -53,8 +56,12 @@ target_link_libraries(LatentAudioTests PRIVATE
     juce::juce_dsp
     juce::juce_gui_extra
     ${ORT_DIR}/lib/onnxruntime.lib
+    delayimp.lib
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags)
+
+# Same loading scheme as the plugin: onnxruntime.dll is delay-loaded from our own folder.
+target_link_options(LatentAudioTests PRIVATE /DELAYLOAD:onnxruntime.dll)
 
 # The tests need the ONNX Runtime DLL next to the executable.
 add_custom_command(TARGET LatentAudioTests POST_BUILD

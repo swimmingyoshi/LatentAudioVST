@@ -568,6 +568,151 @@ public:
 };
 
 //==============================================================================
+// Drives the real editor controls: synthesized mouse events, button clicks, drops.
+class UiInteractionTests : public juce::UnitTest
+{
+public:
+    UiInteractionTests() : juce::UnitTest ("UI interaction", "LatentAudio") {}
+
+    template <typename T>
+    T* find (juce::Component& root, const juce::String& id)
+    {
+        auto* c = dynamic_cast<T*> (root.findChildWithID (id));
+        expect (c != nullptr, "control '" + id + "' exists");
+        return c;
+    }
+
+    void click (juce::Button* b) { if (b != nullptr) { b->triggerClick(); pumpMessages (60); } }
+
+    void runTest() override
+    {
+        using LoadState = LatentAudioVSTAudioProcessor::LoadState;
+
+        beginTest ("drop a model folder onto the editor");
+        Rig r;
+        std::unique_ptr<juce::AudioProcessorEditor> ed (r.proc.createEditor());
+        auto* editor = dynamic_cast<LatentAudioVSTAudioProcessorEditor*> (ed.get());
+        editor->setSize (980, 700);
+        expect (editor->isInterestedInFileDrag ({ tinyModelDir().getFullPathName() }));
+        expect (! editor->isInterestedInFileDrag ({ dataDir().getChildFile ("readme.txt").getFullPathName() }));
+        editor->filesDropped ({ tinyModelDir().getFullPathName() }, 10, 10);
+        expect (r.proc.waitForModelLoad (15000));
+        expect (r.proc.getLoadStatus().state == LoadState::Ready);
+        pumpMessages (150); // editor timer picks up the map
+
+        auto* nebula = find<NebulaComponent> (*editor, "nebula");
+        if (nebula == nullptr) return;
+        auto src = juce::Desktop::getInstance().getMainMouseSource();
+        auto event = [&] (juce::Point<float> pos, juce::ModifierKeys mods, juce::Point<float> downPos, int clicks = 1, bool dragged = false)
+        {
+            const auto now = juce::Time::getCurrentTime();
+            return juce::MouseEvent (src, pos, mods, juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f,
+                                     nebula, nebula, now, downPos, now, clicks, dragged);
+        };
+        const juce::ModifierKeys left (juce::ModifierKeys::leftButtonModifier);
+        const juce::ModifierKeys right (juce::ModifierKeys::rightButtonModifier);
+
+        beginTest ("clicking the map moves the cursor, updates automation and plays");
+        auto pb = nebula->mapToScreen (1.0f, -1.0f); // point "b" (top right)
+        nebula->mouseDown (event (pb, left, pb));
+        nebula->mouseUp (event (pb, {}, pb));
+        expectWithinAbsoluteError (r.proc.getCursor().x, 1.0f, 0.02f);
+        expectWithinAbsoluteError (r.proc.getCursor().y, -1.0f, 0.02f);
+        expectWithinAbsoluteError (r.get ("positionX"), 1.0f, 0.01f);
+        expectWithinAbsoluteError (r.get ("positionY"), 1.0f, 0.01f); // top of the map
+        std::vector<float> out;
+        for (int i = 0; i < 200 && rms (out, 0, (int) out.size()) < 0.01f; ++i)
+        {
+            auto o = r.render (512);
+            out.insert (out.end(), o.begin(), o.end());
+            juce::Thread::sleep (2);
+        }
+        expect (rms (out, 0, (int) out.size()) > 0.01f, "click produced sound");
+
+        beginTest ("dragging moves the cursor continuously");
+        auto pa = nebula->mapToScreen (-1.0f, -1.0f);
+        nebula->mouseDown (event (pa, left, pa));
+        const auto mid = (pa + pb) * 0.5f;
+        nebula->mouseDrag (event (mid, left, pa, 1, true));
+        expectWithinAbsoluteError (r.proc.getCursor().x, 0.0f, 0.03f);
+        nebula->mouseUp (event (mid, {}, pa, 1, true));
+
+        beginTest ("right-drag pans without moving the cursor; wheel zooms; double-click resets");
+        const auto cursorBefore = r.proc.getCursor();
+        const auto before = nebula->mapToScreen (0.0f, 1.0f);
+        nebula->mouseDown (event (mid, right, mid));
+        nebula->mouseDrag (event (mid + juce::Point<float> (100.0f, 0.0f), right, mid, 1, true));
+        nebula->mouseUp (event (mid + juce::Point<float> (100.0f, 0.0f), {}, mid, 1, true));
+        expectWithinAbsoluteError (nebula->mapToScreen (0.0f, 1.0f).x - before.x, 100.0f, 1.0f);
+        expect (r.proc.getCursor() == cursorBefore);
+
+        const float spanBefore = nebula->mapToScreen (1.0f, -1.0f).x - nebula->mapToScreen (-1.0f, -1.0f).x;
+        juce::MouseWheelDetails wheel { 0.0f, 0.5f, false, false, false };
+        nebula->mouseWheelMove (event (mid, {}, mid), wheel);
+        const float spanAfter = nebula->mapToScreen (1.0f, -1.0f).x - nebula->mapToScreen (-1.0f, -1.0f).x;
+        expect (spanAfter > spanBefore * 1.1f, "wheel zoomed in");
+
+        nebula->mouseDoubleClick (event (mid, left, mid, 2));
+        expectWithinAbsoluteError (nebula->mapToScreen (0.0f, 1.0f).x, before.x, 0.5f);
+
+        beginTest ("Snap toggle snaps clicks to the nearest sound");
+        click (find<juce::ToggleButton> (*editor, "snapMode"));
+        expectEquals (r.get ("snapMode"), 1.0f);
+        pumpMessages (100);
+        auto near = nebula->mapToScreen (0.1f, -0.9f); // closest to "b"
+        nebula->mouseDown (event (near, left, near));
+        nebula->mouseUp (event (near, {}, near));
+        expectEquals (r.proc.getCursor().x, 1.0f);
+        expectEquals (r.proc.getCursor().y, -1.0f);
+        click (find<juce::ToggleButton> (*editor, "snapMode"));
+
+        beginTest ("toolbar buttons and toggles");
+        click (find<juce::Button> (*editor, "center"));
+        expectWithinAbsoluteError (r.proc.getCursor().x, 0.0f, 1.0e-4f);
+        expectWithinAbsoluteError (r.proc.getCursor().y, 0.0f, 1.0e-4f);
+
+        click (find<juce::Button> (*editor, "random"));
+        const auto c = r.proc.getCursor();
+        auto map = r.proc.getMapSnapshot();
+        const int nearest = map->nearestIndex (c.x, c.y);
+        expect (std::hypot (c.x - map->points[(size_t) nearest].x, c.y - map->points[(size_t) nearest].y) < 0.1f,
+                "random lands on a sound");
+
+        for (auto id : { "triggerOnMidi", "latchMode", "keyTrack" })
+        {
+            click (find<juce::ToggleButton> (*editor, id));
+            expectEquals (r.get (id), 1.0f, id);
+            click (find<juce::ToggleButton> (*editor, id));
+            expectEquals (r.get (id), 0.0f, id);
+        }
+
+        beginTest ("knobs drive parameters; Reset restores defaults");
+        if (auto* rate = find<juce::Slider> (*editor, "playbackRate"))
+            rate->setValue (1.5, juce::sendNotificationSync);
+        if (auto* gain = find<juce::Slider> (*editor, "outputGain"))
+            gain->setValue (0.5, juce::sendNotificationSync);
+        expectWithinAbsoluteError (r.get ("playbackRate"), 1.5f, 1.0e-3f);
+        expectWithinAbsoluteError (r.get ("outputGain"), 0.5f, 1.0e-3f);
+        if (auto* gain = find<juce::Slider> (*editor, "outputGain"))
+            expectEquals (gain->getTextFromValue (0.5), juce::String ("-6.0 dB"));
+        click (find<juce::Button> (*editor, "reset"));
+        expectWithinAbsoluteError (r.get ("playbackRate"), 1.0f, 1.0e-3f);
+        expectWithinAbsoluteError (r.get ("outputGain"), 1.0f, 1.0e-3f);
+
+        beginTest ("Unload clears the model and the map view");
+        click (find<juce::Button> (*editor, "unload"));
+        expect (r.proc.getLoadStatus().state == LoadState::Empty);
+        expect (r.proc.getMapSnapshot() == nullptr);
+        pumpMessages (100);
+        if (auto* unload = find<juce::Button> (*editor, "unload"))
+            expect (! unload->isEnabled(), "Unload disabled with no model");
+        ed.reset();
+    }
+};
+
+static UiInteractionTests uiInteractionTests;
+
+//==============================================================================
 // Optional: set LATENTAUDIO_REAL_MODEL to an exported model folder.
 class RealModelTests : public juce::UnitTest
 {
