@@ -737,23 +737,36 @@ public:
         auto map = r.proc.getMapSnapshot();
         if (map == nullptr) return;
 
-        // Time a few decodes at different positions.
-        std::vector<double> latencies;
-        for (int k = 0; k < 5; ++k)
+        // Time the decoder directly (what one position change costs), the way the
+        // plugin runs it: one thread, on a model file shared through the cache.
         {
-            const auto& p = map->points[(size_t) (k * 37 % (int) map->points.size())];
-            const auto before = r.proc.getDisplayVersion();
-            t0 = juce::Time::getMillisecondCounterHiRes();
-            r.proc.triggerFromUI (p.x, p.y);
-            r.proc.releaseFromUI();
-            while (r.proc.getDisplayVersion() == before && juce::Time::getMillisecondCounterHiRes() - t0 < 30000)
-                juce::Thread::sleep (1);
-            latencies.push_back (juce::Time::getMillisecondCounterHiRes() - t0);
-            juce::Thread::sleep (150); // stay clear of the inference rate limit
+            juce::File onnx, json;
+            juce::String err;
+            LatentAudioVSTAudioProcessor::findModelFiles (juce::File (path), onnx, json, err);
+            LatentDecoder dec;
+            expect (dec.loadModel (onnx).ok);
+            std::vector<double> ms;
+            std::vector<float> audio;
+            for (int k = 0; k < 12; ++k)
+            {
+                const auto& p = map->points[(size_t) (k * 37 % (int) map->points.size())];
+                const auto t = juce::Time::getMillisecondCounterHiRes();
+                expect (dec.decode (p.latent, audio));
+                if (k >= 2) ms.push_back (juce::Time::getMillisecondCounterHiRes() - t); // skip warm-up
+            }
+            std::sort (ms.begin(), ms.end());
+            logMessage ("    decode latency median: " + juce::String (ms[ms.size() / 2], 1) + " ms, max: "
+                        + juce::String (ms.back(), 1) + " ms (" + dec.getActiveProvider() + ", "
+                        + juce::String ((int) audio.size()) + " samples)");
         }
-        std::sort (latencies.begin(), latencies.end());
-        logMessage ("    decode latency median: " + juce::String (latencies[latencies.size() / 2], 1) + " ms, max: "
-                    + juce::String (latencies.back(), 1) + " ms (" + r.proc.getActiveProvider() + ")");
+
+        r.proc.triggerFromUI (map->points.front().x, map->points.front().y);
+        r.proc.releaseFromUI();
+        for (int i = 0; i < 300 && ! r.proc.hasAudio(); ++i)
+        {
+            r.render (512);
+            juce::Thread::sleep (5);
+        }
 
         auto out = r.render (48000);
         expect (allFinite (out));
