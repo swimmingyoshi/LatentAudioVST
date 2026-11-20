@@ -255,6 +255,43 @@ public:
             expectLessThan (peak (out, 23500, 26000), 1.0e-3f);
         }
 
+        beginTest ("pitched Key Track: plays the note at once, then crossfades to the model's real note");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("keyTrack", 1.0f);
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100), 69.0f);  // decoded at A4
+            r.render (512);
+            // A5: resampled x2 immediately
+            auto first = r.render (8820, { { 0, juce::MidiMessage::noteOn (1, 81, 1.0f) } });
+            expectWithinAbsoluteError (measureFrequency (first, 500, 8800, 44100.0), 880.0, 4.0);
+            // (no model loaded here, so nothing is requested; the model-request path is
+            //  covered by the "pitched model" test with the tiny pitched model)
+            const float headBefore = r.proc.getPlayheadNormalized();
+            // the model's own A5 arrives (labelled 81): played at ratio 1, still 880 Hz, no jump
+            r.proc.injectDecodedAudio (sine (880.0, 44100.0, 44100), 81.0f);
+            auto second = r.render (8820);
+            expectWithinAbsoluteError (measureFrequency (second, 4000, 8800, 44100.0), 880.0, 4.0);
+            first.insert (first.end(), second.begin(), second.end());
+            expectLessThan (maxStep (first), 0.2f);
+            // after the swap the playhead advances at ratio 1 (it moved at ratio 2 before)
+            const float headAfter = r.proc.getPlayheadNormalized();
+            expect (headAfter > 0.0f && headAfter < headBefore + 0.3f, "playhead continues, slower");
+        }
+
+        beginTest ("unpitched sounds still transpose relative to Root");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("keyTrack", 1.0f);
+            r.set ("rootNote", 60.0f);
+            r.proc.injectDecodedAudio (sine (500.0, 44100.0, 44100));  // no pitch label
+            r.render (512);
+            auto out = r.render (20000, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
+            expectWithinAbsoluteError (measureFrequency (out, 1000, 19000, 44100.0), 1000.0, 5.0);
+            expect (std::isnan (r.proc.getRequestedMidi()), "no note is requested from unpitched models");
+        }
+
         beginTest ("filter: stable at full resonance, correct response at zero");
         {
             Rig r;
@@ -466,6 +503,43 @@ public:
         expectEquals (json.getFileName(), juce::String ("sound_map.json"));
         expect (LatentAudioVSTAudioProcessor::findModelFiles (dir.getChildFile ("latent_decoder.onnx"), onnx, json, err));
         dir.deleteRecursively();
+
+        beginTest ("pitched model: a played note is requested from the model");
+        {
+            Rig p;
+            p.proc.loadModelFolderAsync (tinyPitchedDir());
+            expect (p.proc.waitForModelLoad (15000));
+            expect (p.proc.isPitchedModel());
+            expect (p.proc.getLoadStatus().message.contains ("any note"), p.proc.getLoadStatus().message);
+            pumpMessages (100);
+            p.set ("triggerOnMidi", 1.0f);
+            p.set ("keyTrack", 1.0f);
+            p.proc.moveCursorFromUI (-1.0f, -1.0f);  // point "a": natural pitch 60
+            for (int i = 0; i < 2000 && ! p.proc.hasAudio(); ++i) { p.render (256); juce::Thread::sleep (1); }
+            const auto before = p.proc.getDisplayVersion();
+            p.render (256, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
+            for (int i = 0; i < 3000 && p.proc.getDisplayVersion() == before; ++i) juce::Thread::sleep (1);
+            std::vector<float> wave;
+            p.proc.copyDisplayWaveform (wave);
+            std::vector<float> z (kTinyLatentDim + 1, 0.0f);
+            z[0] = 1.0f;
+            z[(size_t) kTinyLatentDim] = (72.0f - 60.0f) / 24.0f;  // the note we played
+            std::vector<float> expected (kTinySamples);
+            for (int j = 0; j < kTinySamples; ++j)
+            {
+                double acc = 0.0;
+                for (int i = 0; i <= kTinyLatentDim; ++i)
+                    acc += z[(size_t) i] * 0.5 * std::sin (0.37 * i + 0.011 * j);
+                expected[(size_t) j] = (float) std::tanh (acc);
+            }
+            expectEquals ((int) wave.size(), kTinySamples);
+            if (wave.size() > 500)
+                expectWithinAbsoluteError (wave[500], expected[500], 1.0e-4f);
+
+            p.set ("keyTrack", 0.0f);  // back to the sound's own pitch
+            p.render (256);
+            expect (std::isnan (p.proc.getRequestedMidi()));
+        }
 
         beginTest ("unload frees the model");
         r.proc.unloadModel();

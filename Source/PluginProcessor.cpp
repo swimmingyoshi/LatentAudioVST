@@ -295,11 +295,11 @@ void LatentAudioVSTAudioProcessor::resetParametersToDefaults()
     }
 }
 
-void LatentAudioVSTAudioProcessor::injectDecodedAudio (std::vector<float> audio)
+void LatentAudioVSTAudioProcessor::injectDecodedAudio (std::vector<float> audio, float midi)
 {
     if (audio.empty() || ! std::all_of (audio.begin(), audio.end(), [] (float v) { return std::isfinite (v); }))
         return;
-    publishAudio (std::move (audio), modelGeneration.load());
+    publishAudio (std::move (audio), modelGeneration.load(), midi);
 }
 
 void LatentAudioVSTAudioProcessor::copyDisplayWaveform (std::vector<float>& dest) const
@@ -329,24 +329,42 @@ void LatentAudioVSTAudioProcessor::serviceInference()
     const auto generation = modelGeneration.load();
 
     std::vector<float> audio;
-    if (! decodeAt (currentX.load(), currentY.load(), audio))
+    float midi = 0.0f;
+    if (! decodeAt (currentX.load(), currentY.load(), requestMidi.load(), audio, midi))
         return;
 
     lastDecodeMs = juce::Time::getMillisecondCounterHiRes();
-    publishAudio (std::move (audio), generation);
+    publishAudio (std::move (audio), generation, midi);
 }
 
-bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, std::vector<float>& audio) const
+bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, float wantMidi, std::vector<float>& audio, float& outMidi) const
 {
     auto map = soundMap.snapshot();
     if (map == nullptr || map->points.empty())
         return false;
 
-    const auto latent = map->interpolate (x, y);
+    auto latent = map->interpolate (x, y);
+    outMidi = std::numeric_limits<float>::quiet_NaN();
+    if (map->hasPitch())
+    {
+        // Pitched models: ask for a specific note, or keep the blended natural pitch.
+        if (std::isfinite (wantMidi))
+            latent[(size_t) map->pitchIndex] = map->midiToLatent (wantMidi);
+        outMidi = map->latentToMidi (latent[(size_t) map->pitchIndex]);
+    }
     if (! decoder.decode (latent, audio))
         return false;
 
     return postProcess (audio);
+}
+
+double LatentAudioVSTAudioProcessor::ratioFor (float bufferMidi, int note) const
+{
+    // Playback-speed factor so a buffer sounds at the held note.
+    if (pKeyTrack->load() < 0.5f || note < 0)
+        return 1.0;
+    const double from = std::isfinite (bufferMidi) ? (double) bufferMidi : (double) pRootNote->load();
+    return std::pow (2.0, ((double) note - from) / 12.0);
 }
 
 bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
@@ -396,7 +414,7 @@ bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
     return true;
 }
 
-void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uint32_t generation)
+void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uint32_t generation, float midi)
 {
     if (generation != modelGeneration.load())
         return; // decoded by a model that has since been replaced
@@ -406,11 +424,13 @@ void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uin
         displayWaveform = audio;
     }
     displayVersion.fetch_add (1);
+    lastPublishedMidi.store (midi);
 
     {
         const juce::SpinLock::ScopedLockType sl (pendingLock);
         std::swap (pendingAudio, audio);
         pendingGeneration = generation;
+        pendingMidi = midi;
         pendingReady.store (true, std::memory_order_release);
     }
     // `audio` now holds the previous pending buffer and is freed here, off the audio thread.
@@ -494,6 +514,8 @@ void LatentAudioVSTAudioProcessor::runLoadJob (juce::File target, bool keepResto
     mapMinX.store (map->minX); mapMaxX.store (map->maxX);
     mapMinY.store (map->minY); mapMaxY.store (map->maxY);
     modelSampleRate.store (map->sampleRate);
+    mapHasPitch.store (map->hasPitch());
+    requestMidi.store (std::numeric_limits<float>::quiet_NaN());
 
     if (! keepRestoredAudio)
     {
@@ -520,7 +542,8 @@ void LatentAudioVSTAudioProcessor::runLoadJob (juce::File target, bool keepResto
         const juce::ScopedLock sl (statusLock);
         status.state = LoadState::Ready;
         status.folder = onnx.getParentDirectory();
-        status.message = juce::String ((int) map->points.size()) + " sounds";
+        status.message = juce::String ((int) map->points.size()) + " sounds"
+                       + (map->hasPitch() ? juce::String ("  |  plays any note with Key Track") : juce::String());
     }
     loadInProgress.store (false);
     LatentLog::write ("[Load] Loaded " + onnx.getFullPathName());
@@ -549,6 +572,8 @@ void LatentAudioVSTAudioProcessor::unloadModel()
     loadInProgress.store (false);
     decoder.unload();
     soundMap.clear();
+    mapHasPitch.store (false);
+    requestMidi.store (std::numeric_limits<float>::quiet_NaN());
     modelGeneration.fetch_add (1);
     resetRequested.store (true);
     {
@@ -599,6 +624,8 @@ void LatentAudioVSTAudioProcessor::getStateInformation (juce::MemoryBlock& destD
         {
             juce::MemoryBlock mb (displayWaveform.data(), displayWaveform.size() * sizeof (float));
             state.setProperty ("audio", mb.toBase64Encoding(), nullptr);
+            if (std::isfinite (lastPublishedMidi.load()))
+                state.setProperty ("audioMidi", lastPublishedMidi.load(), nullptr);
         }
     }
 
@@ -657,7 +684,9 @@ void LatentAudioVSTAudioProcessor::setStateInformation (const void* data, int si
     resetRequested.store (true);
     const bool haveAudio = ! audio.empty();
     if (haveAudio)
-        injectDecodedAudio (std::move (audio));
+        injectDecodedAudio (std::move (audio), state.hasProperty ("audioMidi")
+                                                   ? (float) state["audioMidi"]
+                                                   : std::numeric_limits<float>::quiet_NaN());
 
     if (target != juce::File() && (target.isDirectory() || target.existsAsFile()))
     {
@@ -712,6 +741,7 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
     {
         activeAudio.clear();     // clear() keeps capacity: no deallocation here
         incomingAudio.clear();
+        activeMidi = incomingMidi = std::numeric_limits<float>::quiet_NaN();
         voice = {};
         crossfading = false;
         stealGain = 0.0f;
@@ -728,6 +758,15 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
 
     if (startRequested.exchange (false) && ! activeAudio.empty())
         startVoice (-1, 1.0f);
+
+    // Key Track turned off on a pitched model: go back to each sound's natural pitch.
+    const bool keyTrack = pKeyTrack->load() > 0.5f;
+    if (lastKeyTrack && ! keyTrack && mapHasPitch.load() && std::isfinite (requestMidi.load()))
+    {
+        requestMidi.store (std::numeric_limits<float>::quiet_NaN());
+        requestInference (false);
+    }
+    lastKeyTrack = keyTrack;
 
     // Turning Hold off lets a looping voice finish (unless a note still holds it).
     const bool latch = pLatch->load() > 0.5f;
@@ -801,6 +840,8 @@ void LatentAudioVSTAudioProcessor::takePendingAudio()
     if (voice.playing && ! voice.released && ! activeAudio.empty())
     {
         std::swap (incomingAudio, pendingAudio);
+        incomingMidi = pendingMidi;
+        incomingRatio = ratioFor (incomingMidi, voice.note);
         crossfading = true;
         crossfadePos = 0.0f;
         crossfadeInc = (float) (1.0 / (kSwapFadeSeconds * hostSampleRate));
@@ -808,6 +849,7 @@ void LatentAudioVSTAudioProcessor::takePendingAudio()
     else
     {
         std::swap (activeAudio, pendingAudio);
+        activeMidi = pendingMidi;
         if (waitingNoteStart)
         {
             waitingNoteStart = false;
@@ -842,7 +884,8 @@ void LatentAudioVSTAudioProcessor::renderOfflineInference()
     offlineServicedSeq = seq;
 
     std::vector<float> audio;
-    if (! decodeAt (currentX.load(), currentY.load(), audio))
+    float midi = 0.0f;
+    if (! decodeAt (currentX.load(), currentY.load(), requestMidi.load(), audio, midi))
         return;
 
     {
@@ -850,10 +893,18 @@ void LatentAudioVSTAudioProcessor::renderOfflineInference()
         displayWaveform = audio;
     }
     displayVersion.fetch_add (1);
+    lastPublishedMidi.store (midi);
 
     if (crossfading)
         finishCrossfade();
+    const double oldRatio = voice.noteRatio;
     std::swap (activeAudio, audio);   // hard swap: matches realtime timing best offline
+    activeMidi = midi;
+    if (voice.playing)
+    {
+        voice.noteRatio = ratioFor (activeMidi, voice.note);
+        voice.pos = voice.pos / oldRatio * voice.noteRatio;
+    }
     audioAvailable.store (true);
 
     const bool audition = playOnArrival.exchange (false);
@@ -876,17 +927,46 @@ void LatentAudioVSTAudioProcessor::handleMidi (const juce::MidiMessage& m)
         if (pTriggerOnMidi->load() < 0.5f)
             return;
 
+        const int note = m.getNoteNumber();
+        // Pitched model + Key Track: ask the model for this exact note. The voice
+        // starts now on the current sound (resampled) and crossfades to the real
+        // note when it arrives; offline it is decoded right here.
+        const bool askModel = mapHasPitch.load() && pKeyTrack->load() > 0.5f;
+        if (askModel)
+            requestMidi.store ((float) note);
+
         if (activeAudio.empty())
         {
             // No sound yet: start as soon as one arrives.
             waitingNoteStart = true;
-            waitingNote = m.getNoteNumber();
+            waitingNote = note;
             waitingVelocity = m.getFloatVelocity();
             if (decoder.isModelLoaded())
                 requestInference (false);
             return;
         }
-        startVoice (m.getNoteNumber(), m.getFloatVelocity());
+
+        if (askModel && ! (std::abs (activeMidi - (float) note) < 0.01f))
+        {
+            if (isNonRealtime())
+            {
+                std::vector<float> audio;
+                float midi = 0.0f;
+                if (decodeAt (currentX.load(), currentY.load(), (float) note, audio, midi))
+                {
+                    if (crossfading)
+                        finishCrossfade();
+                    std::swap (activeAudio, audio);
+                    activeMidi = midi;
+                    offlineServicedSeq = requestSeq.load();
+                }
+            }
+            else
+            {
+                requestInference (false);
+            }
+        }
+        startVoice (note, m.getFloatVelocity());
     }
     else if (m.isNoteOff())
     {
@@ -929,7 +1009,6 @@ void LatentAudioVSTAudioProcessor::startVoice (int note, float velocity)
     }
 
     const float sens = juce::jlimit (0.0f, 1.0f, pVelocity->load());
-    const bool keyTrack = pKeyTrack->load() > 0.5f && note >= 0;
 
     voice.playing = true;
     voice.released = false;
@@ -937,7 +1016,7 @@ void LatentAudioVSTAudioProcessor::startVoice (int note, float velocity)
     voice.pos = juce::jlimit (0.0f, 0.9f, pStart->load()) * (double) len;
     voice.note = note;
     voice.velocityGain = 1.0f - sens + sens * juce::jlimit (0.0f, 1.0f, velocity);
-    voice.noteRatio = keyTrack ? std::pow (2.0, (note - (double) pRootNote->load()) / 12.0) : 1.0;
+    voice.noteRatio = ratioFor (activeMidi, note);
 }
 
 void LatentAudioVSTAudioProcessor::releaseVoice()
@@ -948,7 +1027,12 @@ void LatentAudioVSTAudioProcessor::releaseVoice()
 
 void LatentAudioVSTAudioProcessor::finishCrossfade()
 {
+    // The incoming buffer may play at a different speed (it was decoded at the held
+    // note instead of being resampled to it): keep the same point in time.
     std::swap (activeAudio, incomingAudio);
+    voice.pos = voice.pos / voice.noteRatio * incomingRatio;
+    voice.noteRatio = incomingRatio;
+    std::swap (activeMidi, incomingMidi);
     crossfading = false;
     crossfadePos = 0.0f;
 }
@@ -1022,7 +1106,8 @@ void LatentAudioVSTAudioProcessor::renderVoice (float* out, int startSample, int
                 if (crossfading)
                 {
                     const int inLen = (int) incomingAudio.size();
-                    const float next = inLen > 3 ? readHermite (incomingAudio.data(), inLen, voice.pos) : 0.0f;
+                    const double inPos = voice.pos / voice.noteRatio * incomingRatio;
+                    const float next = inLen > 3 ? readHermite (incomingAudio.data(), inLen, inPos) : 0.0f;
                     sig = sig * (1.0f - crossfadePos) + next * crossfadePos;
                     crossfadePos += crossfadeInc;
                     if (crossfadePos >= 1.0f)

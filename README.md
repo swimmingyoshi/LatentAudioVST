@@ -117,7 +117,7 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 - **Play on Note**: only MIDI notes start sounds; moving the cursor or automating the position changes the sound without playing it
 - **Hold**: loop between Start and End until released (turning Hold off lets the loop finish)
 - **Snap**: snap the cursor to the nearest sound
-- **Key Track**: MIDI notes transpose the sound relative to Root
+- **Key Track**: MIDI notes set the pitch. *Pitched* models (status shows "plays any note with Key Track") are asked for the real note: the voice starts instantly on the current sound and crossfades to the model's true note ~50-100 ms later. Other models transpose relative to Root
 
 #### Automation-only parameters
 - **Position X / Position Y**: cursor position (0-1, Y = 1 is the top of the map)

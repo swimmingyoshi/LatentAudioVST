@@ -115,6 +115,18 @@ std::shared_ptr<const SoundMapData> SoundMapData::parse (const juce::String& jso
         return nullptr;
     }
 
+    if (auto* pitch = root.getProperty ("pitch", {}).getDynamicObject())
+    {
+        const int index = (int) pitch->getProperty ("index");
+        const float scale = (float) (double) pitch->getProperty ("scale");
+        if (index >= 0 && index < map->latentDim && std::abs (scale) > 1.0e-6f)
+        {
+            map->pitchIndex = index;
+            map->pitchOffset = (float) (double) pitch->getProperty ("offset");
+            map->pitchScale = scale;
+        }
+    }
+
     auto* pointsArray = root.getProperty ("points", {}).getArray();
     if (pointsArray == nullptr)
     {
@@ -133,6 +145,10 @@ std::shared_ptr<const SoundMapData> SoundMapData::parse (const juce::String& jso
         sp.x = (float) p.getProperty ("x", 0.0);
         sp.y = (float) p.getProperty ("y", 0.0);
         sp.label = p.getProperty ("label", {}).toString();
+        if (p.hasProperty ("midi"))
+            sp.midi = (float) (double) p.getProperty ("midi", 0.0);
+        else if (map->pitchIndex >= 0)
+            sp.midi = std::numeric_limits<float>::quiet_NaN(); // filled from the latent below
 
         if (auto* latent = p.getProperty ("latent", {}).getArray())
         {
@@ -154,6 +170,8 @@ std::shared_ptr<const SoundMapData> SoundMapData::parse (const juce::String& jso
         map->maxX = std::max (map->maxX, sp.x);
         map->minY = std::min (map->minY, sp.y);
         map->maxY = std::max (map->maxY, sp.y);
+        if (map->hasPitch() && ! std::isfinite (sp.midi))
+            sp.midi = map->latentToMidi (sp.latent[(size_t) map->pitchIndex]);
         map->points.push_back (std::move (sp));
     }
 

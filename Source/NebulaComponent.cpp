@@ -188,7 +188,9 @@ void NebulaComponent::paint (juce::Graphics& g)
             g.setColour (textPrimary());
             g.drawEllipse (s.x - 6.0f, s.y - 6.0f, 12.0f, 12.0f, 1.2f);
 
-            const auto label = p.label.isNotEmpty() ? p.label : ("Sound " + juce::String (hoverIndex + 1));
+            auto label = p.label.isNotEmpty() ? p.label : ("Sound " + juce::String (hoverIndex + 1));
+            if (std::isfinite (p.midi))
+                label << "  (" << juce::MidiMessage::getMidiNoteName (juce::roundToInt (p.midi), true, true, 4) << ")";
             g.setFont (juce::FontOptions (12.0f));
             auto box = juce::Rectangle<float> (s.x + 10.0f, s.y - 22.0f,
                                                juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), label) + 12.0f, 18.0f);

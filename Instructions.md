@@ -20,7 +20,11 @@ BUTTONS
   without playing it, so muting your MIDI pattern really makes it silent.
 - HOLD: loops the Start-End region until you let go / the note ends. Turning Hold off lets it finish.
 - SNAP: the cursor snaps to the nearest sound.
-- KEY TRACK: MIDI notes transpose the sound. The ROOT knob is the note that plays at original pitch.
+- KEY TRACK: MIDI notes set the pitch.
+  * Pitched models (guitar/strings; the header says "plays any note with Key Track"): the model
+    generates the actual note you play. You hear the note instantly, and the model's real version
+    fades in a moment later. ROOT is not used.
+  * Other models: the sound is transposed; ROOT is the note that plays at original pitch.
 - RANDOM: jumps to a random sound.
 - CENTER: resets the view and puts the cursor in the middle of the map.
 - RESET: puts all knobs back to default (keeps the position).

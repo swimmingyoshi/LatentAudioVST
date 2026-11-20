@@ -19,6 +19,7 @@
 
 #include <JuceHeader.h>
 #include <atomic>
+#include <limits>
 #include "SoundMap.h"
 #include "LatentDecoder.h"
 #include "InferenceThread.h"
@@ -97,8 +98,9 @@ public:
     void triggerRandomPosition();
     void resetParametersToDefaults();
 
-    // Lets state restore and tests hand decoded audio to the player.
-    void injectDecodedAudio (std::vector<float> audio);
+    // Lets state restore and tests hand decoded audio to the player. `midi` is the
+    // note the audio is at (pitched models), NaN if unknown.
+    void injectDecodedAudio (std::vector<float> audio, float midi = std::numeric_limits<float>::quiet_NaN());
 
     //==========================================================================
     // Read-only views for the editor (any thread)
@@ -111,6 +113,9 @@ public:
     uint32_t getDisplayVersion() const { return displayVersion.load(); }
     void copyDisplayWaveform (std::vector<float>& dest) const;
     int getModelSampleRate() const { return modelSampleRate.load(); }
+    bool isPitchedModel() const { return mapHasPitch.load(); }
+    // Note the next decodes are asked for (NaN = each sound's natural pitch).
+    float getRequestedMidi() const { return requestMidi.load(); }
 
     juce::AudioProcessorValueTreeState& getAPVTS() { return *parameters; }
 
@@ -127,9 +132,10 @@ private:
 
     // Inference thread
     void serviceInference();
-    bool decodeAt (float x, float y, std::vector<float>& audio) const;
+    bool decodeAt (float x, float y, float wantMidi, std::vector<float>& audio, float& outMidi) const;
     static bool postProcess (std::vector<float>& audio);
-    void publishAudio (std::vector<float>&& audio, uint32_t generation);
+    void publishAudio (std::vector<float>&& audio, uint32_t generation, float midi);
+    double ratioFor (float bufferMidi, int note) const;
 
     // Loader thread
     void runLoadJob (juce::File folderOrFile, bool keepRestoredAudio, uint32_t token);
@@ -173,6 +179,8 @@ private:
     std::atomic<float> currentX { 0.0f }, currentY { 0.0f };
     std::atomic<uint32_t> requestSeq { 0 };
     std::atomic<bool> playOnArrival { false };
+    std::atomic<float> requestMidi { std::numeric_limits<float>::quiet_NaN() };
+    std::atomic<bool> mapHasPitch { false };
     std::atomic<bool> syncingPositionParams { false };
     bool uiGestureActive = false; // message thread only
 
@@ -185,6 +193,8 @@ private:
     juce::SpinLock pendingLock;
     std::vector<float> pendingAudio;     // guarded by pendingLock
     uint32_t pendingGeneration = 0;      // guarded by pendingLock
+    float pendingMidi = std::numeric_limits<float>::quiet_NaN(); // guarded by pendingLock
+    std::atomic<float> lastPublishedMidi { std::numeric_limits<float>::quiet_NaN() };
     std::atomic<bool> pendingReady { false };
 
     // Inference -> UI
@@ -228,6 +238,10 @@ private:
 
     Voice voice;
     std::vector<float> activeAudio, incomingAudio;
+    float activeMidi = std::numeric_limits<float>::quiet_NaN();   // note each buffer was decoded at
+    float incomingMidi = std::numeric_limits<float>::quiet_NaN();
+    double incomingRatio = 1.0;
+    bool lastKeyTrack = false;
     bool crossfading = false;
     float crossfadePos = 0.0f, crossfadeInc = 0.0f;
     bool waitingNoteStart = false;

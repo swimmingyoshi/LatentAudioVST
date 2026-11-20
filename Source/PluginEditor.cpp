@@ -118,7 +118,8 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     addToggle (playOnNoteToggle, "triggerOnMidi", "Play on Note", "Only MIDI notes start sounds. Moving the cursor changes the sound without playing it.");
     addToggle (holdToggle, "latchMode", "Hold", "Loop the sound between Start and End until released.");
     addToggle (snapToggle, "snapMode", "Snap", "Snap the cursor to the nearest sound on the map.");
-    addToggle (keyTrackToggle, "keyTrack", "Key Track", "MIDI notes transpose the sound relative to the Root note.");
+    addToggle (keyTrackToggle, "keyTrack", "Key Track",
+               "MIDI notes set the pitch. Pitched models play the real note; others transpose relative to Root.");
 
     randomButton.setTooltip ("Jump to a random sound.");
     randomButton.onClick = [this] { processor.triggerRandomPosition(); };
@@ -434,7 +435,8 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
 
     if (rootKnob != nullptr)
     {
-        const bool on = keyTrackToggle.getToggleState();
+        // Pitched models play the actual note, so the root note only applies to others.
+        const bool on = keyTrackToggle.getToggleState() && ! processor.isPitchedModel();
         rootKnob->slider.setEnabled (on);
         rootKnob->slider.setAlpha (on ? 1.0f : 0.4f);
         rootKnob->label.setAlpha (on ? 1.0f : 0.4f);

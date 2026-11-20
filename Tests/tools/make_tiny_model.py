@@ -6,7 +6,7 @@ tanh(z @ W) with deterministic weights, so the tests can recompute the expected
 output exactly:  W[i, j] = 0.5 * sin(0.37 * i + 0.011 * j)
 
 Requires: pip install onnx numpy
-Usage:    python make_tiny_model.py <output_dir>
+Usage:    python make_tiny_model.py [data_dir]   (writes tiny_model/ and tiny_pitched/)
 """
 
 import json
@@ -22,21 +22,21 @@ NUM_SAMPLES = 2205  # 50 ms at 44.1 kHz
 SAMPLE_RATE = 44100
 
 
-def weights() -> np.ndarray:
-    i = np.arange(LATENT_DIM, dtype=np.float64)[:, None]
+def weights(dim: int = LATENT_DIM) -> np.ndarray:
+    i = np.arange(dim, dtype=np.float64)[:, None]
     j = np.arange(NUM_SAMPLES, dtype=np.float64)[None, :]
     return (0.5 * np.sin(0.37 * i + 0.011 * j)).astype(np.float32)
 
 
-def build_model() -> onnx.ModelProto:
-    w = helper.make_tensor("W", TensorProto.FLOAT, [LATENT_DIM, NUM_SAMPLES], weights().tobytes(), raw=True)
+def build_model(dim: int = LATENT_DIM) -> onnx.ModelProto:
+    w = helper.make_tensor("W", TensorProto.FLOAT, [dim, NUM_SAMPLES], weights(dim).tobytes(), raw=True)
     graph = helper.make_graph(
         [
             helper.make_node("MatMul", ["latent_input", "W"], ["pre"]),
             helper.make_node("Tanh", ["pre"], ["audio_output"]),
         ],
         "tiny_decoder",
-        [helper.make_tensor_value_info("latent_input", TensorProto.FLOAT, ["batch_size", LATENT_DIM])],
+        [helper.make_tensor_value_info("latent_input", TensorProto.FLOAT, ["batch_size", dim])],
         [helper.make_tensor_value_info("audio_output", TensorProto.FLOAT, ["batch_size", NUM_SAMPLES])],
         [w],
     )
@@ -55,9 +55,23 @@ def build_map() -> dict:
     return {"latent_dim": LATENT_DIM, "sample_rate": SAMPLE_RATE, "points": points}
 
 
+def build_pitched_map() -> dict:
+    """Same 3 points, plus a pitch element: latent[8] = (midi - 60) / 24."""
+    m = build_map()
+    for p, midi in zip(m["points"], (60.0, 64.0, 67.0)):
+        p["latent"] = p["latent"] + [(midi - 60.0) / 24.0]
+        p["midi"] = midi
+    m["latent_dim"] = LATENT_DIM + 1
+    m["pitch"] = {"index": LATENT_DIM, "offset": 60.0, "scale": 24.0}
+    return m
+
+
 if __name__ == "__main__":
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "data/tiny_model")
-    out.mkdir(parents=True, exist_ok=True)
-    onnx.save(build_model(), str(out / "latent_decoder.onnx"))
-    (out / "sound_map.json").write_text(json.dumps(build_map(), indent=1))
-    print(f"wrote {out}")
+    out = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
+    for name, model, smap in (("tiny_model", build_model(), build_map()),
+                              ("tiny_pitched", build_model(LATENT_DIM + 1), build_pitched_map())):
+        d = out / name
+        d.mkdir(parents=True, exist_ok=True)
+        onnx.save(model, str(d / "latent_decoder.onnx"))
+        (d / "sound_map.json").write_text(json.dumps(smap, indent=1))
+        print(f"wrote {d}")

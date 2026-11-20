@@ -18,6 +18,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct SoundPoint
     float y = 0.0f;
     juce::String label;
     std::vector<float> latent;
+    float midi = std::numeric_limits<float>::quiet_NaN(); // pitched models: the sound's note
 };
 
 //==============================================================================
@@ -39,6 +41,14 @@ struct SoundMapData
     int sampleRate = 44100;
     float minX = 0.0f, maxX = 0.0f;
     float minY = 0.0f, maxY = 0.0f;
+
+    // Pitch-conditioned models: latent[pitchIndex] = (midi - pitchOffset) / pitchScale.
+    // The plugin can overwrite that element to ask the model for a specific note.
+    int pitchIndex = -1;
+    float pitchOffset = 60.0f, pitchScale = 24.0f;
+    bool hasPitch() const { return pitchIndex >= 0 && pitchIndex < latentDim; }
+    float latentToMidi (float v) const { return v * pitchScale + pitchOffset; }
+    float midiToLatent (float midi) const { return (midi - pitchOffset) / pitchScale; }
 
     float rangeX() const { return maxX - minX > 1.0e-6f ? maxX - minX : 1.0f; }
     float rangeY() const { return maxY - minY > 1.0e-6f ? maxY - minY : 1.0f; }

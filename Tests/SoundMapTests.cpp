@@ -65,6 +65,23 @@ public:
         expect (holder.isLoaded());
         expectEquals ((int) holder.snapshot()->points.size(), 3);
 
+        beginTest ("pitch block: index, scale, per-point notes");
+        auto pitched = SoundMapData::load (tinyPitchedDir().getChildFile ("sound_map.json"), err);
+        expect (pitched != nullptr, err);
+        if (pitched != nullptr)
+        {
+            expect (pitched->hasPitch());
+            expectEquals (pitched->pitchIndex, kTinyLatentDim);
+            expectEquals (pitched->latentDim, kTinyLatentDim + 1);
+            expectEquals (pitched->points[1].midi, 64.0f);
+            expectWithinAbsoluteError (pitched->midiToLatent (72.0f), 0.5f, 1.0e-6f);
+            expectWithinAbsoluteError (pitched->latentToMidi (pitched->midiToLatent (55.5f)), 55.5f, 1.0e-4f);
+        }
+        expect (! map->hasPitch(), "maps without a pitch block are not pitched");
+        auto badPitch = SoundMapData::parse (
+            "{\"latent_dim\": 2, \"pitch\": {\"index\": 5, \"offset\": 60, \"scale\": 24}, \"points\": [{\"x\":0,\"y\":0,\"latent\":[1,2]}]}", err);
+        expect (badPitch != nullptr && ! badPitch->hasPitch(), "out-of-range pitch index is ignored");
+
         beginTest ("snapshots stay valid after the map is replaced");
         auto snap = holder.snapshot();
         holder.clear();

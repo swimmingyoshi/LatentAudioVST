@@ -8,6 +8,7 @@ namespace TestHelpers
 {
     inline juce::File dataDir() { return juce::File (LATENTAUDIO_TEST_DATA); }
     inline juce::File tinyModelDir() { return dataDir().getChildFile ("tiny_model"); }
+    inline juce::File tinyPitchedDir() { return dataDir().getChildFile ("tiny_pitched"); }
 
     constexpr int kTinyLatentDim = 8;
     constexpr int kTinySamples = 2205;
