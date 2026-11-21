@@ -150,12 +150,24 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     addAndMakeVisible (waveform);
     nebula.setComponentID ("nebula");
     waveform.setComponentID ("waveform");
+    waveform.exportName = [this]
+    {
+        juce::String name;
+        if (auto map = processor.getMapSnapshot(); map != nullptr && ! map->points.empty())
+        {
+            const auto c = processor.getCursor();
+            const auto& p = map->points[(size_t) map->nearestIndex (c.x, c.y)];
+            name = p.label.isNotEmpty() ? p.label.upToLastOccurrenceOf (".", false, false) : juce::String ("sound");
+        }
+        return name;
+    };
 
     // --- Knobs ---
     addKnob ("playbackRate", "Rate", "Playback speed (also changes pitch).", 0);
     addKnob ("fineTune", "Tune", "Fine tune in cents.", 0);
     addKnob ("crossfade", "Loop X-Fade", "Crossfade at the loop point when Hold is on.", 0);
     rootKnob = &addKnob ("rootNote", "Root", "With Key Track on, this note plays at the original pitch.", 0);
+    addKnob ("polyphony", "Voices", "How many notes can play at once (1 = mono: a new note cuts the last).", 0);
 
     addAndMakeVisible (filterGraph);
     addKnob ("filterCutoff", "Cutoff", "Low-pass cutoff frequency.", 1);
@@ -332,9 +344,9 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     area.removeFromBottom (8);
     nebula.setBounds (area);
 
-    // Three sections: playback (4 knobs), filter (graph + 2 knobs), output (4 knobs)
-    const int unit = controls.getWidth() / 10;
-    sectionAreas[0] = controls.removeFromLeft (unit * 4).reduced (3, 0);
+    // Three sections: playback (5 knobs), filter (graph + 2 knobs), output (4 knobs)
+    const int unit = controls.getWidth() / 11;
+    sectionAreas[0] = controls.removeFromLeft (unit * 5).reduced (3, 0);
     sectionAreas[1] = controls.removeFromLeft (unit * 3).reduced (3, 0);
     sectionAreas[2] = controls.reduced (3, 0);
 
@@ -416,6 +428,7 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
         std::vector<float> wave;
         processor.copyDisplayWaveform (wave);
         waveform.setWaveform (std::move (wave));
+        waveform.setSampleRate (processor.getModelSampleRate());
     }
     auto& params = processor.getAPVTS();
     const float start = params.getRawParameterValue ("sampleStart")->load();

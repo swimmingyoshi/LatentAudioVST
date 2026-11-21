@@ -1,6 +1,7 @@
 #include "TestHelpers.h"
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "WaveformComponent.h"
 
 using namespace TestHelpers;
 
@@ -289,7 +290,52 @@ public:
             r.render (512);
             auto out = r.render (20000, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
             expectWithinAbsoluteError (measureFrequency (out, 1000, 19000, 44100.0), 1000.0, 5.0);
-            expect (std::isnan (r.proc.getRequestedMidi()), "no note is requested from unpitched models");
+            expect (! r.proc.isNoteWanted (72), "no note is requested from unpitched models");
+        }
+
+        beginTest ("polyphony: chords, voice limit, release tails");
+        {
+            Rig r;
+            r.set ("triggerOnMidi", 1.0f);
+            r.set ("keyTrack", 1.0f);
+            r.set ("rootNote", 69.0f);
+            r.proc.injectDecodedAudio (sine (440.0, 44100.0, 44100));
+            r.render (512);
+            auto one = r.render (4410, { { 0, juce::MidiMessage::noteOn (1, 69, 1.0f) } });
+            r.render (2048, { { 0, juce::MidiMessage::noteOff (1, 69) } });
+            expectEquals (r.proc.getActiveVoiceCount(), 0);
+
+            auto chord = r.render (4410, { { 0, juce::MidiMessage::noteOn (1, 69, 1.0f) },
+                                           { 0, juce::MidiMessage::noteOn (1, 76, 1.0f) },
+                                           { 0, juce::MidiMessage::noteOn (1, 81, 1.0f) } });
+            expectEquals (r.proc.getActiveVoiceCount(), 3);
+            expect (rms (chord, 1000, 4400) > 1.4f * rms (one, 1000, 4400), "three notes are louder than one");
+            expect (allFinite (chord));
+            expectLessThan (maxStep (chord), 0.5f);
+
+            r.render (512, { { 0, juce::MidiMessage::noteOff (1, 76) } });
+            r.render (2048);
+            expectEquals (r.proc.getActiveVoiceCount(), 2);   // only the released note stopped
+            r.render (512, { { 0, juce::MidiMessage::allNotesOff (1) } });
+            r.render (2048);
+            expectEquals (r.proc.getActiveVoiceCount(), 0);
+
+            r.set ("polyphony", 2.0f);
+            r.render (512, { { 0, juce::MidiMessage::noteOn (1, 60, 1.0f) }, { 10, juce::MidiMessage::noteOn (1, 62, 1.0f) },
+                             { 20, juce::MidiMessage::noteOn (1, 64, 1.0f) } });
+            r.render (1024);
+            expectEquals (r.proc.getActiveVoiceCount(), 2);   // oldest note was cut
+
+            r.set ("polyphony", 1.0f);
+            auto mono = r.render (4096, { { 0, juce::MidiMessage::noteOn (1, 65, 1.0f) } });
+            expectEquals (r.proc.getActiveVoiceCount(), 1);
+            expectLessThan (maxStep (mono), 0.5f);             // the cut is declicked
+            r.render (512, { { 0, juce::MidiMessage::allNotesOff (1) } });
+
+            // same note twice: retrigger, not a doubled voice
+            r.set ("polyphony", 8.0f);
+            r.render (2048, { { 0, juce::MidiMessage::noteOn (1, 69, 1.0f) }, { 1000, juce::MidiMessage::noteOn (1, 69, 1.0f) } });
+            expectEquals (r.proc.getActiveVoiceCount(), 1);
         }
 
         beginTest ("filter: stable at full resonance, correct response at zero");
@@ -516,11 +562,8 @@ public:
             p.set ("keyTrack", 1.0f);
             p.proc.moveCursorFromUI (-1.0f, -1.0f);  // point "a": natural pitch 60
             for (int i = 0; i < 2000 && ! p.proc.hasAudio(); ++i) { p.render (256); juce::Thread::sleep (1); }
-            const auto before = p.proc.getDisplayVersion();
-            p.render (256, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
-            for (int i = 0; i < 3000 && p.proc.getDisplayVersion() == before; ++i) juce::Thread::sleep (1);
-            std::vector<float> wave;
-            p.proc.copyDisplayWaveform (wave);
+            p.set ("latchMode", 1.0f);   // the tiny sound is 50 ms: keep notes sounding while held
+            for (int i = 0; i < 100; ++i) { p.render (256); juce::Thread::sleep (2); }  // cursor decode settles
             std::vector<float> z (kTinyLatentDim + 1, 0.0f);
             z[0] = 1.0f;
             z[(size_t) kTinyLatentDim] = (72.0f - 60.0f) / 24.0f;  // the note we played
@@ -532,13 +575,34 @@ public:
                     acc += z[(size_t) i] * 0.5 * std::sin (0.37 * i + 0.011 * j);
                 expected[(size_t) j] = (float) std::tanh (acc);
             }
-            expectEquals ((int) wave.size(), kTinySamples);
-            if (wave.size() > 500)
-                expectWithinAbsoluteError (wave[500], expected[500], 1.0e-4f);
+            // The cursor's own decode may still land first; wait for the note's.
+            p.render (256, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
+            std::vector<float> wave;
+            bool gotNote = false;
+            for (int i = 0; i < 3000 && ! gotNote; ++i)
+            {
+                p.proc.copyDisplayWaveform (wave);
+                gotNote = wave.size() > 500 && std::abs (wave[500] - expected[500]) < 1.0e-4f;
+                if (! gotNote) { p.render (256); juce::Thread::sleep (1); }
+            }
+            expect (gotNote, "the model was asked for the played note");
 
-            p.set ("keyTrack", 0.0f);  // back to the sound's own pitch
-            p.render (256);
-            expect (std::isnan (p.proc.getRequestedMidi()));
+            expect (p.proc.isNoteWanted (72));
+            p.set ("latchMode", 0.0f);
+            p.render (256, { { 0, juce::MidiMessage::noteOff (1, 72) } });
+            p.render (4096);
+            expect (! p.proc.isNoteWanted (72), "released notes are no longer decoded");
+            p.set ("latchMode", 1.0f);
+
+            beginTest ("pitched model: a chord gets one decode per note");
+            const auto v0 = p.proc.getDisplayVersion();
+            p.render (256, { { 0, juce::MidiMessage::noteOn (1, 60, 1.0f) },
+                             { 0, juce::MidiMessage::noteOn (1, 64, 1.0f) },
+                             { 0, juce::MidiMessage::noteOn (1, 67, 1.0f) } });
+            expect (p.proc.isNoteWanted (60) && p.proc.isNoteWanted (64) && p.proc.isNoteWanted (67));
+            for (int i = 0; i < 3000 && p.proc.getDisplayVersion() < v0 + 3; ++i) { p.render (256); juce::Thread::sleep (1); }
+            expect (p.proc.getDisplayVersion() >= v0 + 3, "three notes decoded");
+            expectEquals (p.proc.getActiveVoiceCount(), 3);
         }
 
         beginTest ("unload frees the model");
@@ -616,6 +680,33 @@ public:
 
     void runTest() override
     {
+        beginTest ("export: the Start-End region round-trips as a WAV");
+        {
+            const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("latentaudio_export_test");
+            dir.deleteRecursively();
+            const auto file = dir.getChildFile ("out.wav");
+            auto audio = sine (441.0, 44100.0, 44100, 0.5f);
+            juce::String err;
+            expect (WaveformComponent::writeWav (file, audio, 44100, 0.25f, 0.75f, err), err);
+            juce::AudioFormatManager fm;
+            fm.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (file));
+            expect (reader != nullptr);
+            if (reader != nullptr)
+            {
+                expectEquals ((int) reader->lengthInSamples, 22050);
+                expectEquals ((int) reader->sampleRate, 44100);
+                juce::AudioBuffer<float> b (1, 22050);
+                reader->read (&b, 0, 22050, 0, true, false);
+                std::vector<float> back (b.getReadPointer (0), b.getReadPointer (0) + 22050);
+                expectWithinAbsoluteError (back[5000], audio[11025 + 5000], 1.0e-4f);
+                expectLessThan (std::abs (back.back()), 0.01f);   // faded at the cut
+                expectWithinAbsoluteError (measureFrequency (back, 500, 21000, 44100.0), 441.0, 1.0);
+            }
+            expect (! WaveformComponent::writeWav (file, {}, 44100, 0.0f, 1.0f, err) && err.isNotEmpty());
+            dir.deleteRecursively();
+        }
+
         beginTest ("layout works from minimum to large sizes");
         Rig r;
         std::unique_ptr<juce::AudioProcessorEditor> ed (r.proc.createEditor());

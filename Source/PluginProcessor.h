@@ -99,8 +99,10 @@ public:
     void resetParametersToDefaults();
 
     // Lets state restore and tests hand decoded audio to the player. `midi` is the
-    // note the audio is at (pitched models), NaN if unknown.
-    void injectDecodedAudio (std::vector<float> audio, float midi = std::numeric_limits<float>::quiet_NaN());
+    // note the audio is at (pitched models), NaN if unknown. `note` >= 0 delivers it
+    // as that held note's own sound (pitched Key Track); -1 = the sound at the cursor.
+    void injectDecodedAudio (std::vector<float> audio, float midi = std::numeric_limits<float>::quiet_NaN(),
+                             int note = -1);
 
     //==========================================================================
     // Read-only views for the editor (any thread)
@@ -114,8 +116,12 @@ public:
     void copyDisplayWaveform (std::vector<float>& dest) const;
     int getModelSampleRate() const { return modelSampleRate.load(); }
     bool isPitchedModel() const { return mapHasPitch.load(); }
-    // Note the next decodes are asked for (NaN = each sound's natural pitch).
-    float getRequestedMidi() const { return requestMidi.load(); }
+    // Pitched models with Key Track: notes the model is asked to generate.
+    bool isNoteWanted (int note) const
+    {
+        return note >= 0 && note < 128 && ((wantedNotes[note / 64].load() >> (note % 64)) & 1u) != 0;
+    }
+    int getActiveVoiceCount() const { return activeVoiceCount.load(); }
 
     juce::AudioProcessorValueTreeState& getAPVTS() { return *parameters; }
 
@@ -134,20 +140,29 @@ private:
     void serviceInference();
     bool decodeAt (float x, float y, float wantMidi, std::vector<float>& audio, float& outMidi) const;
     static bool postProcess (std::vector<float>& audio);
-    void publishAudio (std::vector<float>&& audio, uint32_t generation, float midi);
+    bool publishAudio (std::vector<float>&& audio, uint32_t generation, float midi, int note, uint32_t seq);
+    bool decodeNoteIfNeeded (int note, bool refresh);
     double ratioFor (float bufferMidi, int note) const;
 
     // Loader thread
     void runLoadJob (juce::File folderOrFile, bool keepRestoredAudio, uint32_t token);
 
     // Audio thread
+    struct Slot;
     void takePendingAudio();
     void renderOfflineInference();
     void handleMidi (const juce::MidiMessage& m);
+    void noteOn (int note, float velocity);
     void startVoice (int note, float velocity);
-    void releaseVoice();
-    void renderVoice (float* out, int startSample, int endSample, double baseSpeed);
-    void finishCrossfade();
+    void releaseVoicesForNote (int note);
+    void releaseAllVoices();
+    int findNoteSlot (int note) const;
+    int allocateNoteSlot (int note);
+    bool slotInUse (int slotIndex) const;
+    void storeInSlot (int slotIndex, std::vector<float>& audio, float midi, int note, uint32_t seq, bool fade);
+    void updateWantedNotes();
+    bool pitchedKeyTrack() const { return mapHasPitch.load() && pKeyTrack->load() > 0.5f; }
+    void renderVoices (float* out, int startSample, int endSample, double baseSpeed);
 
     //==========================================================================
     std::unique_ptr<juce::AudioProcessorValueTreeState> parameters;
@@ -170,6 +185,7 @@ private:
     std::atomic<float>* pKeyTrack = nullptr;
     std::atomic<float>* pRootNote = nullptr;
     std::atomic<float>* pVelocity = nullptr;
+    std::atomic<float>* pPolyphony = nullptr;
 
     //==========================================================================
     SoundMap soundMap;
@@ -179,7 +195,6 @@ private:
     std::atomic<float> currentX { 0.0f }, currentY { 0.0f };
     std::atomic<uint32_t> requestSeq { 0 };
     std::atomic<bool> playOnArrival { false };
-    std::atomic<float> requestMidi { std::numeric_limits<float>::quiet_NaN() };
     std::atomic<bool> mapHasPitch { false };
     std::atomic<bool> syncingPositionParams { false };
     bool uiGestureActive = false; // message thread only
@@ -189,13 +204,29 @@ private:
     std::atomic<int> modelSampleRate { 44100 };
     std::atomic<uint32_t> modelGeneration { 1 };
 
-    // Inference -> audio hand-off
+    static constexpr int kMaxVoices = 16;           // physical voices (release tails included)
+    static constexpr int kNoteSlots = 8;            // per-note sounds (pitched models, Key Track)
+    static constexpr int kSlots = 1 + kNoteSlots;   // slot 0 = the sound at the cursor
+
+    // Inference -> audio hand-off: one entry per target (cursor sound or a note).
+    struct Pending
+    {
+        std::vector<float> audio;
+        float midi = std::numeric_limits<float>::quiet_NaN();
+        int note = -1;              // -1 = cursor sound
+        uint32_t generation = 0;
+        uint32_t seq = 0;           // position request it was decoded for
+        bool ready = false;
+    };
     juce::SpinLock pendingLock;
-    std::vector<float> pendingAudio;     // guarded by pendingLock
-    uint32_t pendingGeneration = 0;      // guarded by pendingLock
-    float pendingMidi = std::numeric_limits<float>::quiet_NaN(); // guarded by pendingLock
-    std::atomic<float> lastPublishedMidi { std::numeric_limits<float>::quiet_NaN() };
+    Pending pending[kSlots];        // guarded by pendingLock
     std::atomic<bool> pendingReady { false };
+    std::atomic<float> lastPublishedMidi { std::numeric_limits<float>::quiet_NaN() };
+
+    // Audio -> inference: notes held with Key Track on a pitched model (bitmask),
+    // and the position request each note was last decoded for (0 = needs decode).
+    std::atomic<uint64_t> wantedNotes[2] {};
+    std::atomic<uint32_t> noteDecodedSeq[128] {};  // seq + 1 the note was decoded for
 
     // Inference -> UI
     mutable juce::CriticalSection displayLock;
@@ -210,6 +241,7 @@ private:
     std::atomic<float> playheadNorm { -1.0f };
     std::atomic<bool> audioAvailable { false };
     std::atomic<uint32_t> midiActivityCount { 0 };
+    std::atomic<int> activeVoiceCount { 0 };
 
     // Inference thread state
     uint32_t servicedSeq = 0;
@@ -225,34 +257,43 @@ private:
 
     //==========================================================================
     // Audio-thread-only state
+    struct Slot
+    {
+        std::vector<float> cur, prev;   // prev = content fading out after a swap
+        float curMidi = std::numeric_limits<float>::quiet_NaN();
+        float prevMidi = std::numeric_limits<float>::quiet_NaN();
+        float fade = 1.0f, fadeInc = 0.0f;
+        int note = -1;                  // note slots: which note this sound is
+        uint32_t seq = 0;
+    };
+
     struct Voice
     {
         bool playing = false;
         bool released = false;
-        double pos = 0.0;
-        float envLevel = 0.0f;
+        bool fastRelease = false;
+        bool held = false;          // MIDI note still down
+        double t = 0.0;             // elapsed source time (model samples at ratio 1)
+        float env = 0.0f;
         float velocityGain = 1.0f;
-        double noteRatio = 1.0;
-        int note = -1;
+        int note = -1;              // -1 = started from the UI
+        int slot = 0;
+        int wantSlot = -1;          // note slot this voice moves to once it has audio
+        int fromSlot = -1;          // switching from this slot (crossfade)
+        float switchFade = 1.0f;
+        uint32_t age = 0;
     };
 
-    Voice voice;
-    std::vector<float> activeAudio, incomingAudio;
-    float activeMidi = std::numeric_limits<float>::quiet_NaN();   // note each buffer was decoded at
-    float incomingMidi = std::numeric_limits<float>::quiet_NaN();
-    double incomingRatio = 1.0;
-    bool lastKeyTrack = false;
-    bool crossfading = false;
-    float crossfadePos = 0.0f, crossfadeInc = 0.0f;
-    bool waitingNoteStart = false;
-    int waitingNote = -1;
-    float waitingVelocity = 1.0f;
+    struct WaitingNote { int note; float velocity; };
+
+    Slot slots[kSlots];
+    Voice voices[kMaxVoices];
+    WaitingNote waiting[kMaxVoices];
+    int numWaiting = 0;
+    uint32_t voiceCounter = 0;
+    uint32_t audioGeneration = 0;
     bool lastLatch = false;
     uint32_t offlineServicedSeq = 0;
-
-    // Retrigger declick: fades out the old read head when a voice restarts.
-    double stealPos = 0.0, stealSpeed = 1.0;
-    float stealGain = 0.0f, stealInc = 0.0f;
 
     double hostSampleRate = 44100.0;
     juce::dsp::StateVariableTPTFilter<float> filterA, filterB;

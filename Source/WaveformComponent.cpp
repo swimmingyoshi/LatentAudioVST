@@ -18,6 +18,151 @@
 #include "WaveformComponent.h"
 #include "LatentLookAndFeel.h"
 
+WaveformComponent::WaveformComponent()
+{
+    setTooltip ("Drag onto a track in your DAW to use this sound. Right-click to save it as a WAV.");
+    setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+}
+
+juce::File WaveformComponent::exportFolder()
+{
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+        .getChildFile ("LatentAudio").getChildFile ("Exports");
+}
+
+bool WaveformComponent::writeWav (const juce::File& file, const std::vector<float>& audio, int rate,
+                                  float start, float end, juce::String& error)
+{
+    const int n = (int) audio.size();
+    const int from = juce::jlimit (0, n, (int) std::floor (juce::jlimit (0.0f, 1.0f, start) * (float) n));
+    const int to = juce::jlimit (from, n, (int) std::ceil (juce::jlimit (0.0f, 1.0f, end) * (float) n));
+    if (to - from < 4)
+    {
+        error = "No sound to export";
+        return false;
+    }
+
+    const auto dir = file.getParentDirectory();
+    if (! dir.createDirectory())
+    {
+        error = "Cannot create " + dir.getFullPathName();
+        return false;
+    }
+    file.deleteFile();
+    std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+    if (! static_cast<juce::FileOutputStream*> (stream.get())->openedOk())
+    {
+        error = "Cannot write " + file.getFullPathName();
+        return false;
+    }
+
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        wav.createWriterFor (stream.get(), (double) rate, 1, 24, {}, 0));
+    if (writer == nullptr)
+    {
+        error = "WAV writer failed";
+        return false;
+    }
+    stream.release(); // owned by the writer now
+
+    // Short fades so a trimmed region does not click.
+    std::vector<float> region (audio.begin() + from, audio.begin() + to);
+    const int len = (int) region.size();
+    const int fadeIn = from > 0 ? std::min (64, len / 4) : 0;
+    const int fadeOut = to < n ? std::min (256, len / 4) : 0;
+    for (int i = 0; i < fadeIn; ++i)
+        region[(size_t) i] *= (float) i / (float) fadeIn;
+    for (int i = 0; i < fadeOut; ++i)
+        region[(size_t) (len - 1 - i)] *= (float) i / (float) fadeOut;
+
+    const float* channels[] = { region.data() };
+    if (! writer->writeFromFloatArrays (channels, 1, len))
+    {
+        error = "Write failed";
+        return false;
+    }
+    return true;
+}
+
+juce::File WaveformComponent::exportToFolder (juce::String& error) const
+{
+    auto stem = exportName != nullptr ? exportName() : juce::String();
+    stem = juce::File::createLegalFileName (stem.trim()).replaceCharacter (' ', '_');
+    if (stem.isEmpty())
+        stem = "sound";
+    const auto stamp = juce::Time::getCurrentTime().formatted ("%Y%m%d_%H%M%S");
+    const auto file = exportFolder().getNonexistentChildFile ("LatentAudio_" + stem + "_" + stamp, ".wav", false);
+    if (! writeWav (file, waveform, sampleRate, regionStart, regionEnd, error))
+        return {};
+    return file;
+}
+
+void WaveformComponent::mouseDown (const juce::MouseEvent& e)
+{
+    dragStarted = false;
+    if (! e.mods.isPopupMenu() || waveform.empty())
+        return;
+
+    juce::PopupMenu menu;
+    menu.addItem (1, "Save as WAV...");
+    menu.addItem (2, "Save to exports folder");
+    menu.addItem (3, "Open exports folder");
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+        [safe = juce::Component::SafePointer<WaveformComponent> (this)] (int choice)
+        {
+            auto* self = safe.getComponent();
+            if (self == nullptr || choice == 0)
+                return;
+            juce::String error;
+            if (choice == 2)
+            {
+                const auto f = self->exportToFolder (error);
+                if (f != juce::File())
+                    f.revealToUser();
+            }
+            else if (choice == 3)
+            {
+                exportFolder().createDirectory();
+                exportFolder().startAsProcess();
+            }
+            else
+            {
+                auto stem = self->exportName != nullptr ? self->exportName() : juce::String ("sound");
+                self->chooser = std::make_unique<juce::FileChooser> (
+                    "Save sound as WAV",
+                    exportFolder().getChildFile (juce::File::createLegalFileName (stem) + ".wav"), "*.wav");
+                self->chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                    [safe] (const juce::FileChooser& fc)
+                    {
+                        auto* me = safe.getComponent();
+                        const auto target = fc.getResult();
+                        if (me == nullptr || target == juce::File())
+                            return;
+                        juce::String err;
+                        if (! writeWav (target.withFileExtension ("wav"), me->waveform, me->sampleRate,
+                                        me->regionStart, me->regionEnd, err))
+                            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Save failed", err);
+                    });
+            }
+            if (error.isNotEmpty())
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Export failed", error);
+        });
+}
+
+void WaveformComponent::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragStarted || e.mods.isPopupMenu() || waveform.empty() || e.getDistanceFromDragStart() < 6)
+        return;
+    dragStarted = true;
+
+    juce::String error;
+    const auto file = exportToFolder (error);
+    if (file == juce::File())
+        return;
+    juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this);
+}
+
 void WaveformComponent::setWaveform (std::vector<float> audioData)
 {
     waveform = std::move (audioData);

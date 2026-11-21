@@ -107,6 +107,9 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "velocitySens", 2 }, "Velocity Sensitivity", Range (0.0f, 1.0f), 0.0f,
         floatAttr (formatPercent)));
 
+    // Version 3
+    p.push_back (std::make_unique<juce::AudioParameterInt> (PID { "polyphony", 3 }, "Voices", 1, 8, 8));
+
     parameters = std::make_unique<juce::AudioProcessorValueTreeState> (
         *this, nullptr, "PARAMETERS", juce::AudioProcessorValueTreeState::ParameterLayout (p.begin(), p.end()));
 
@@ -117,6 +120,7 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     pPosX = raw ("positionX");        pPosY = raw ("positionY");      pInferenceRate = raw ("inferenceRate");
     pLatch = raw ("latchMode");       pTriggerOnMidi = raw ("triggerOnMidi");
     pKeyTrack = raw ("keyTrack");     pRootNote = raw ("rootNote");   pVelocity = raw ("velocitySens");
+    pPolyphony = raw ("polyphony");
 
     parameters->addParameterListener ("positionX", this);
     parameters->addParameterListener ("positionY", this);
@@ -295,11 +299,11 @@ void LatentAudioVSTAudioProcessor::resetParametersToDefaults()
     }
 }
 
-void LatentAudioVSTAudioProcessor::injectDecodedAudio (std::vector<float> audio, float midi)
+void LatentAudioVSTAudioProcessor::injectDecodedAudio (std::vector<float> audio, float midi, int note)
 {
     if (audio.empty() || ! std::all_of (audio.begin(), audio.end(), [] (float v) { return std::isfinite (v); }))
         return;
-    publishAudio (std::move (audio), modelGeneration.load(), midi);
+    publishAudio (std::move (audio), modelGeneration.load(), midi, note, requestSeq.load());
 }
 
 void LatentAudioVSTAudioProcessor::copyDisplayWaveform (std::vector<float>& dest) const
@@ -316,8 +320,27 @@ void LatentAudioVSTAudioProcessor::serviceInference()
     if (isNonRealtime())
         return;
 
+    auto forEachWantedNote = [this] (auto&& fn)
+    {
+        for (int w = 0; w < 2; ++w)
+        {
+            const uint64_t bits = wantedNotes[w].load();
+            for (int b = 0; b < 64; ++b)
+                if ((bits >> b) & 1u)
+                    if (! fn (w * 64 + b))
+                        return;
+        }
+    };
+
+    // 1. Notes just played get their own decode right away (not rate limited).
+    forEachWantedNote ([this] (int n) { decodeNoteIfNeeded (n, false); return true; });
+
+    // 2. Cursor moved: the sound at the cursor, then the held notes at the new place.
     const auto seq = requestSeq.load();
-    if (seq == servicedSeq)
+    const bool cursorStale = seq != servicedSeq;
+    bool notesStale = false;
+    forEachWantedNote ([&] (int n) { notesStale = noteDecodedSeq[n].load() != seq + 1; return ! notesStale; });
+    if (! cursorStale && ! notesStale)
         return;
 
     const float rate = pInferenceRate->load();
@@ -325,16 +348,39 @@ void LatentAudioVSTAudioProcessor::serviceInference()
     if (rate > 0.0f && now - lastDecodeMs < 1000.0 / rate)
         return; // rate-limited: the poll retries shortly with the newest position
 
-    servicedSeq = seq;
-    const auto generation = modelGeneration.load();
+    if (cursorStale)
+    {
+        servicedSeq = seq;
+        const auto generation = modelGeneration.load();
+        std::vector<float> audio;
+        float midi = 0.0f;
+        if (decodeAt (currentX.load(), currentY.load(), std::numeric_limits<float>::quiet_NaN(), audio, midi))
+            publishAudio (std::move (audio), generation, midi, -1, seq);
+    }
+    forEachWantedNote ([this] (int n)
+    {
+        decodeNoteIfNeeded (n, true);
+        return true;
+    });
+    lastDecodeMs = juce::Time::getMillisecondCounterHiRes();
+}
 
+bool LatentAudioVSTAudioProcessor::decodeNoteIfNeeded (int note, bool refresh)
+{
+    // refresh = false: only notes never decoded for this hold; true: also stale ones.
+    const auto seq = requestSeq.load();   // read before the position: errs towards re-decoding
+    const auto done = noteDecodedSeq[note].load();
+    if (done == seq + 1 || (! refresh && done != 0))
+        return false;
+
+    const auto generation = modelGeneration.load();
     std::vector<float> audio;
     float midi = 0.0f;
-    if (! decodeAt (currentX.load(), currentY.load(), requestMidi.load(), audio, midi))
-        return;
-
-    lastDecodeMs = juce::Time::getMillisecondCounterHiRes();
-    publishAudio (std::move (audio), generation, midi);
+    if (! decodeAt (currentX.load(), currentY.load(), (float) note, audio, midi))
+        return false;
+    if (publishAudio (std::move (audio), generation, midi, note, seq))
+        noteDecodedSeq[note].store (seq + 1);
+    return true;
 }
 
 bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, float wantMidi, std::vector<float>& audio, float& outMidi) const
@@ -414,10 +460,11 @@ bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
     return true;
 }
 
-void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uint32_t generation, float midi)
+bool LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uint32_t generation, float midi,
+                                                 int note, uint32_t seq)
 {
     if (generation != modelGeneration.load())
-        return; // decoded by a model that has since been replaced
+        return true; // decoded by a model that has since been replaced
 
     {
         const juce::ScopedLock sl (displayLock);
@@ -428,12 +475,28 @@ void LatentAudioVSTAudioProcessor::publishAudio (std::vector<float>&& audio, uin
 
     {
         const juce::SpinLock::ScopedLockType sl (pendingLock);
-        std::swap (pendingAudio, audio);
-        pendingGeneration = generation;
-        pendingMidi = midi;
+        // Entry 0 is the cursor sound; notes use the entry already holding that note, or a free one.
+        int target = note < 0 ? 0 : -1;
+        for (int i = 1; i < kSlots && target < 0; ++i)
+            if (pending[i].ready && pending[i].note == note)
+                target = i;
+        for (int i = 1; i < kSlots && target < 0; ++i)
+            if (! pending[i].ready)
+                target = i;
+        if (target < 0)
+            return false; // audio thread is behind; retried on the next poll
+
+        auto& e = pending[target];
+        std::swap (e.audio, audio);
+        e.midi = midi;
+        e.note = note;
+        e.generation = generation;
+        e.seq = seq;
+        e.ready = true;
         pendingReady.store (true, std::memory_order_release);
     }
-    // `audio` now holds the previous pending buffer and is freed here, off the audio thread.
+    // `audio` now holds a previous buffer and is freed here, off the audio thread.
+    return true;
 }
 
 //==============================================================================
@@ -515,7 +578,7 @@ void LatentAudioVSTAudioProcessor::runLoadJob (juce::File target, bool keepResto
     mapMinY.store (map->minY); mapMaxY.store (map->maxY);
     modelSampleRate.store (map->sampleRate);
     mapHasPitch.store (map->hasPitch());
-    requestMidi.store (std::numeric_limits<float>::quiet_NaN());
+    for (auto& d : noteDecodedSeq) d.store (0);
 
     if (! keepRestoredAudio)
     {
@@ -573,7 +636,6 @@ void LatentAudioVSTAudioProcessor::unloadModel()
     decoder.unload();
     soundMap.clear();
     mapHasPitch.store (false);
-    requestMidi.store (std::numeric_limits<float>::quiet_NaN());
     modelGeneration.fetch_add (1);
     resetRequested.store (true);
     {
@@ -739,16 +801,41 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
 
     if (resetRequested.exchange (false))
     {
-        activeAudio.clear();     // clear() keeps capacity: no deallocation here
-        incomingAudio.clear();
-        activeMidi = incomingMidi = std::numeric_limits<float>::quiet_NaN();
-        voice = {};
-        crossfading = false;
-        stealGain = 0.0f;
-        waitingNoteStart = false;
+        for (auto& sl : slots)
+        {
+            sl.cur.clear();      // clear() keeps capacity: no deallocation here
+            sl.prev.clear();
+            sl.curMidi = sl.prevMidi = std::numeric_limits<float>::quiet_NaN();
+            sl.fade = 1.0f;
+            sl.note = -1;
+        }
+        for (auto& v : voices)
+            v = {};
+        numWaiting = 0;
         audioAvailable.store (false);
         filterA.reset();
         filterB.reset();
+    }
+
+    // A new model invalidates the per-note sounds.
+    if (const auto gen = modelGeneration.load(); gen != audioGeneration)
+    {
+        audioGeneration = gen;
+        for (int i = 1; i < kSlots; ++i)
+        {
+            slots[i].note = -1;
+            slots[i].cur.clear();
+            slots[i].prev.clear();
+        }
+        for (auto& v : voices)
+        {
+            if (v.slot > 0 || v.fromSlot > 0)
+            {
+                v.released = v.fastRelease = true;
+                v.fromSlot = -1;
+            }
+            v.wantSlot = -1;
+        }
     }
 
     if (isNonRealtime())
@@ -756,22 +843,15 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
     else
         takePendingAudio();
 
-    if (startRequested.exchange (false) && ! activeAudio.empty())
+    if (startRequested.exchange (false) && ! slots[0].cur.empty())
         startVoice (-1, 1.0f);
 
-    // Key Track turned off on a pitched model: go back to each sound's natural pitch.
-    const bool keyTrack = pKeyTrack->load() > 0.5f;
-    if (lastKeyTrack && ! keyTrack && mapHasPitch.load() && std::isfinite (requestMidi.load()))
-    {
-        requestMidi.store (std::numeric_limits<float>::quiet_NaN());
-        requestInference (false);
-    }
-    lastKeyTrack = keyTrack;
-
-    // Turning Hold off lets a looping voice finish (unless a note still holds it).
+    // Turning Hold off lets looping voices finish (unless a note still holds them).
     const bool latch = pLatch->load() > 0.5f;
-    if (lastLatch && ! latch && voice.playing && voice.note < 0)
-        releaseVoice();
+    if (lastLatch && ! latch)
+        for (auto& v : voices)
+            if (v.playing && ! v.held)
+                v.released = true;
     lastLatch = latch;
 
     const double ratio = (double) modelSampleRate.load() / hostSampleRate;
@@ -784,11 +864,12 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
     for (const auto meta : midi)
     {
         const int at = juce::jlimit (0, numSamples, meta.samplePosition);
-        renderVoice (out, pos, at, baseSpeed);
+        renderVoices (out, pos, at, baseSpeed);
         handleMidi (meta.getMessage());
         pos = at;
     }
-    renderVoice (out, pos, numSamples, baseSpeed);
+    renderVoices (out, pos, numSamples, baseSpeed);
+    updateWantedNotes();
 
     // Filter + output level
     const float nyquistSafe = (float) (0.45 * hostSampleRate);
@@ -816,53 +897,205 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
     for (int ch = 1; ch < buffer.getNumChannels(); ++ch)
         buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
 
-    const int len = (int) activeAudio.size();
-    playheadNorm.store (voice.playing && len > 0 ? (float) (voice.pos / (double) len) : -1.0f);
+    // Playhead of the newest sounding voice.
+    const Voice* newest = nullptr;
+    int count = 0;
+    for (const auto& v : voices)
+    {
+        if (! v.playing) continue;
+        ++count;
+        if (! v.released && (newest == nullptr || v.age > newest->age))
+            newest = &v;
+    }
+    activeVoiceCount.store (count);
+    float head = -1.0f;
+    if (newest != nullptr)
+    {
+        const auto& sl = slots[newest->slot];
+        if (! sl.cur.empty())
+            head = (float) (newest->t * ratioFor (sl.curMidi, newest->note) / (double) sl.cur.size());
+    }
+    playheadNorm.store (head);
+}
+
+bool LatentAudioVSTAudioProcessor::slotInUse (int slotIndex) const
+{
+    for (const auto& v : voices)
+        if (v.playing && (v.slot == slotIndex || v.fromSlot == slotIndex || v.wantSlot == slotIndex))
+            return true;
+    for (int i = 0; i < numWaiting; ++i)
+        if (findNoteSlot (waiting[i].note) == slotIndex)
+            return true;
+    return false;
+}
+
+int LatentAudioVSTAudioProcessor::findNoteSlot (int note) const
+{
+    if (note < 0)
+        return -1;
+    for (int i = 1; i < kSlots; ++i)
+        if (slots[i].note == note)
+            return i;
+    return -1;
+}
+
+int LatentAudioVSTAudioProcessor::allocateNoteSlot (int note)
+{
+    if (const int existing = findNoteSlot (note); existing > 0)
+        return existing;
+    // A free slot: never assigned, or no voice uses it any more.
+    int best = -1;
+    for (int i = 1; i < kSlots && best < 0; ++i)
+        if (slots[i].note < 0)
+            best = i;
+    for (int i = 1; i < kSlots && best < 0; ++i)
+        if (! slotInUse (i))
+            best = i;
+    if (best < 0)
+        return -1; // all busy: the note plays the cursor sound resampled
+
+    auto& sl = slots[best];
+    sl.note = note;
+    sl.cur.clear();
+    sl.prev.clear();
+    sl.fade = 1.0f;
+    sl.seq = 0;
+    return best;
+}
+
+void LatentAudioVSTAudioProcessor::updateWantedNotes()
+{
+    uint64_t bits[2] = { 0, 0 };
+    if (pitchedKeyTrack())
+    {
+        for (int i = 1; i < kSlots; ++i)
+        {
+            const int n = slots[i].note;
+            bool used = false;
+            for (const auto& v : voices)
+                used = used || (v.playing && ! v.released && (v.slot == i || v.wantSlot == i));
+            for (int w = 0; w < numWaiting && ! used; ++w)
+                used = waiting[w].note == n;
+            if (n >= 0 && used)
+                bits[n / 64] |= uint64_t (1) << (n % 64);
+        }
+    }
+    const bool added = (bits[0] & ~wantedNotes[0].load()) != 0 || (bits[1] & ~wantedNotes[1].load()) != 0;
+    wantedNotes[0].store (bits[0]);
+    wantedNotes[1].store (bits[1]);
+    if (added)
+        inferenceThread.wake();
+}
+
+void LatentAudioVSTAudioProcessor::storeInSlot (int slotIndex, std::vector<float>& audio, float midi, int note,
+                                                uint32_t seq, bool fade)
+{
+    auto& sl = slots[slotIndex];
+    bool used = false;
+    for (const auto& v : voices)
+        used = used || (v.playing && (v.slot == slotIndex || v.fromSlot == slotIndex));
+
+    if (fade && used && ! sl.cur.empty())
+    {
+        // Fade from the old content to the new one (voices on this slot follow).
+        std::swap (sl.prev, sl.cur);
+        sl.prevMidi = sl.curMidi;
+        std::swap (sl.cur, audio);
+        sl.fade = 0.0f;
+        sl.fadeInc = (float) (1.0 / (kSwapFadeSeconds * hostSampleRate));
+    }
+    else
+    {
+        std::swap (sl.cur, audio);
+        sl.fade = 1.0f;
+    }
+    sl.curMidi = midi;
+    sl.seq = seq;
+    if (slotIndex > 0)
+        sl.note = note;
+
+    if (slotIndex > 0 && sl.cur.size() >= 4)
+    {
+        // Voices waiting for this note's own sound crossfade over to it.
+        for (auto& v : voices)
+        {
+            if (v.playing && v.wantSlot == slotIndex && v.slot != slotIndex)
+            {
+                v.fromSlot = v.slot;
+                v.slot = slotIndex;
+                v.switchFade = 0.0f;
+            }
+        }
+    }
+
+    // Notes that arrived before any sound existed start now.
+    if (numWaiting > 0)
+    {
+        int keep = 0;
+        for (int i = 0; i < numWaiting; ++i)
+        {
+            const auto w = waiting[i];
+            const int ns = findNoteSlot (w.note);
+            const bool ready = ! slots[0].cur.empty() || (ns > 0 && ! slots[ns].cur.empty());
+            if (ready)
+                startVoice (w.note, w.velocity);
+            else
+                waiting[keep++] = w;
+        }
+        numWaiting = keep;
+    }
 }
 
 void LatentAudioVSTAudioProcessor::takePendingAudio()
 {
-    if (! pendingReady.load (std::memory_order_acquire) || crossfading)
-        return; // never change content mid-fade; take it once the fade completes
+    if (! pendingReady.load (std::memory_order_acquire))
+        return;
 
     const juce::SpinLock::ScopedTryLockType lock (pendingLock);
     if (! lock.isLocked())
         return; // inference thread is mid-publish; next block
 
-    if (pendingGeneration != modelGeneration.load() || pendingAudio.empty())
+    bool remaining = false;
+    const auto gen = modelGeneration.load();
+    for (int i = 0; i < kSlots; ++i)
     {
-        pendingReady.store (false);
-        return;
-    }
-
-    const bool audition = playOnArrival.exchange (false);
-
-    if (voice.playing && ! voice.released && ! activeAudio.empty())
-    {
-        std::swap (incomingAudio, pendingAudio);
-        incomingMidi = pendingMidi;
-        incomingRatio = ratioFor (incomingMidi, voice.note);
-        crossfading = true;
-        crossfadePos = 0.0f;
-        crossfadeInc = (float) (1.0 / (kSwapFadeSeconds * hostSampleRate));
-    }
-    else
-    {
-        std::swap (activeAudio, pendingAudio);
-        activeMidi = pendingMidi;
-        if (waitingNoteStart)
+        auto& e = pending[i];
+        if (! e.ready)
+            continue;
+        if (e.generation != gen || e.audio.empty())
         {
-            waitingNoteStart = false;
-            startVoice (waitingNote, waitingVelocity);
+            e.ready = false;
+            continue;
         }
-        else if (audition)
+
+        const int slotIndex = e.note < 0 ? 0 : findNoteSlot (e.note);
+        if (slotIndex < 0 || (slotIndex > 0 && ! pitchedKeyTrack()))
         {
-            startVoice (-1, 1.0f);
+            e.ready = false; // the note was let go and its slot reused
+            continue;
+        }
+        if (slots[slotIndex].fade < 1.0f)
+        {
+            remaining = true; // never change content mid-fade; take it once the fade completes
+            continue;
+        }
+
+        storeInSlot (slotIndex, e.audio, e.midi, e.note, e.seq, true);
+        e.ready = false;
+        if (slotIndex == 0)
+        {
+            audioAvailable.store (true);
+            if (playOnArrival.exchange (false))
+            {
+                bool uiVoice = false;
+                for (const auto& v : voices)
+                    uiVoice = uiVoice || (v.playing && ! v.released && v.note < 0);
+                if (! uiVoice)
+                    startVoice (-1, 1.0f);
+            }
         }
     }
-
-    pendingReady.store (false);
-    audioAvailable.store (true);
+    pendingReady.store (remaining);
 }
 
 void LatentAudioVSTAudioProcessor::renderOfflineInference()
@@ -879,13 +1112,13 @@ void LatentAudioVSTAudioProcessor::renderOfflineInference()
     }
 
     const auto seq = requestSeq.load();
-    if (seq == offlineServicedSeq && ! activeAudio.empty())
+    if (seq == offlineServicedSeq && ! slots[0].cur.empty())
         return;
     offlineServicedSeq = seq;
 
     std::vector<float> audio;
     float midi = 0.0f;
-    if (! decodeAt (currentX.load(), currentY.load(), requestMidi.load(), audio, midi))
+    if (! decodeAt (currentX.load(), currentY.load(), std::numeric_limits<float>::quiet_NaN(), audio, midi))
         return;
 
     {
@@ -894,28 +1127,30 @@ void LatentAudioVSTAudioProcessor::renderOfflineInference()
     }
     displayVersion.fetch_add (1);
     lastPublishedMidi.store (midi);
-
-    if (crossfading)
-        finishCrossfade();
-    const double oldRatio = voice.noteRatio;
-    std::swap (activeAudio, audio);   // hard swap: matches realtime timing best offline
-    activeMidi = midi;
-    if (voice.playing)
-    {
-        voice.noteRatio = ratioFor (activeMidi, voice.note);
-        voice.pos = voice.pos / oldRatio * voice.noteRatio;
-    }
+    storeInSlot (0, audio, midi, -1, seq, true);
     audioAvailable.store (true);
 
-    const bool audition = playOnArrival.exchange (false);
-    if (waitingNoteStart)
+    // Held notes follow the cursor.
+    if (pitchedKeyTrack())
     {
-        waitingNoteStart = false;
-        startVoice (waitingNote, waitingVelocity);
+        for (int i = 1; i < kSlots; ++i)
+        {
+            if (slots[i].note < 0 || ! slotInUse (i))
+                continue;
+            if (slots[i].fade < 1.0f)
+                slots[i].fade = 1.0f;
+            if (decodeAt (currentX.load(), currentY.load(), (float) slots[i].note, audio, midi))
+                storeInSlot (i, audio, midi, slots[i].note, seq, true);
+        }
     }
-    else if (audition && ! (voice.playing && ! voice.released))
+
+    if (playOnArrival.exchange (false))
     {
-        startVoice (-1, 1.0f);
+        bool uiVoice = false;
+        for (const auto& v : voices)
+            uiVoice = uiVoice || (v.playing && ! v.released && v.note < 0);
+        if (! uiVoice)
+            startVoice (-1, 1.0f);
     }
 }
 
@@ -924,49 +1159,8 @@ void LatentAudioVSTAudioProcessor::handleMidi (const juce::MidiMessage& m)
     if (m.isNoteOn())
     {
         midiActivityCount.fetch_add (1);
-        if (pTriggerOnMidi->load() < 0.5f)
-            return;
-
-        const int note = m.getNoteNumber();
-        // Pitched model + Key Track: ask the model for this exact note. The voice
-        // starts now on the current sound (resampled) and crossfades to the real
-        // note when it arrives; offline it is decoded right here.
-        const bool askModel = mapHasPitch.load() && pKeyTrack->load() > 0.5f;
-        if (askModel)
-            requestMidi.store ((float) note);
-
-        if (activeAudio.empty())
-        {
-            // No sound yet: start as soon as one arrives.
-            waitingNoteStart = true;
-            waitingNote = note;
-            waitingVelocity = m.getFloatVelocity();
-            if (decoder.isModelLoaded())
-                requestInference (false);
-            return;
-        }
-
-        if (askModel && ! (std::abs (activeMidi - (float) note) < 0.01f))
-        {
-            if (isNonRealtime())
-            {
-                std::vector<float> audio;
-                float midi = 0.0f;
-                if (decodeAt (currentX.load(), currentY.load(), (float) note, audio, midi))
-                {
-                    if (crossfading)
-                        finishCrossfade();
-                    std::swap (activeAudio, audio);
-                    activeMidi = midi;
-                    offlineServicedSeq = requestSeq.load();
-                }
-            }
-            else
-            {
-                requestInference (false);
-            }
-        }
-        startVoice (note, m.getFloatVelocity());
+        if (pTriggerOnMidi->load() >= 0.5f)
+            noteOn (m.getNoteNumber(), m.getFloatVelocity());
     }
     else if (m.isNoteOff())
     {
@@ -974,72 +1168,158 @@ void LatentAudioVSTAudioProcessor::handleMidi (const juce::MidiMessage& m)
         if (pTriggerOnMidi->load() < 0.5f)
             return;
 
-        if (waitingNoteStart && m.getNoteNumber() == waitingNote)
-            waitingNoteStart = false;
-
-        // Only the note that is sounding may release it (overlapping legato notes).
-        if (voice.playing && m.getNoteNumber() == voice.note)
-        {
-            voice.note = -1;
-            if (pLatch->load() < 0.5f)
-                releaseVoice();
-        }
+        const int note = m.getNoteNumber();
+        int keep = 0;
+        for (int i = 0; i < numWaiting; ++i)
+            if (waiting[i].note != note)
+                waiting[keep++] = waiting[i];
+        numWaiting = keep;
+        releaseVoicesForNote (note);
     }
     else if (m.isAllNotesOff() || m.isAllSoundOff())
     {
-        waitingNoteStart = false;
-        voice.note = -1;
-        releaseVoice();
+        numWaiting = 0;
+        releaseAllVoices();
     }
+}
+
+void LatentAudioVSTAudioProcessor::noteOn (int note, float velocity)
+{
+    // Pitched model + Key Track: every note gets its own decode from the model.
+    // The voice starts now on the cursor sound (resampled) and crossfades to the
+    // real note when it arrives; offline it is decoded right here.
+    if (pitchedKeyTrack())
+    {
+        const int ns = allocateNoteSlot (note);
+        if (ns > 0)
+        {
+            const auto seq = requestSeq.load();
+            auto& sl = slots[ns];
+            const bool fresh = ! sl.cur.empty() && sl.seq == seq && sl.fade >= 1.0f;
+            if (! fresh)
+            {
+                if (isNonRealtime() && decoder.isModelLoaded())
+                {
+                    std::vector<float> audio;
+                    float midi = 0.0f;
+                    if (decodeAt (currentX.load(), currentY.load(), (float) note, audio, midi))
+                        storeInSlot (ns, audio, midi, note, seq, false);
+                }
+                else
+                {
+                    noteDecodedSeq[note].store (0);
+                }
+            }
+        }
+    }
+
+    const int ns = pitchedKeyTrack() ? findNoteSlot (note) : -1;
+    const bool haveSound = ! slots[0].cur.empty() || (ns > 0 && ! slots[ns].cur.empty());
+    if (! haveSound)
+    {
+        // No sound yet: start as soon as one arrives.
+        if (numWaiting < kMaxVoices)
+            waiting[numWaiting++] = { note, velocity };
+        if (decoder.isModelLoaded())
+            requestInference (false);
+        updateWantedNotes();
+        return;
+    }
+
+    startVoice (note, velocity);
+    updateWantedNotes();
 }
 
 void LatentAudioVSTAudioProcessor::startVoice (int note, float velocity)
 {
-    const int len = (int) activeAudio.size();
-    if (len < 4)
+    int slotIndex = 0, wantSlot = -1;
+    if (pitchedKeyTrack() && note >= 0)
+    {
+        wantSlot = findNoteSlot (note);
+        if (wantSlot > 0 && slots[wantSlot].cur.size() >= 4)
+            slotIndex = wantSlot;
+    }
+    if (slots[slotIndex].cur.size() < 4)
         return;
 
-    // Declick: let the old read head fade out briefly instead of jumping.
-    if (voice.playing && voice.envLevel * voice.velocityGain > 1.0e-4f)
+    // Same note (or another click on the map) retriggers: the old voice fades out quickly.
+    // Over the voice limit: the oldest held voice fades out quickly.
+    const int limit = juce::jlimit (1, kMaxVoices, (int) std::lround (pPolyphony->load()));
+    int held = 0;
+    for (auto& v : voices)
     {
-        stealPos = voice.pos;
-        stealSpeed = (double) pRate->load() * voice.noteRatio * (double) modelSampleRate.load() / hostSampleRate;
-        stealGain = voice.envLevel * voice.velocityGain;
-        stealInc = stealGain / (float) (kStealFadeSeconds * hostSampleRate);
+        if (! v.playing || v.released)
+            continue;
+        if (v.note == note)
+            v.released = v.fastRelease = true;
+        else
+            ++held;
+    }
+    while (held >= limit)
+    {
+        Voice* oldest = nullptr;
+        for (auto& v : voices)
+            if (v.playing && ! v.released && (oldest == nullptr || v.age < oldest->age))
+                oldest = &v;
+        if (oldest == nullptr)
+            break;
+        oldest->released = oldest->fastRelease = true;
+        --held;
     }
 
+    // A free voice, or the quietest releasing one.
+    Voice* target = nullptr;
+    for (auto& v : voices)
+        if (! v.playing) { target = &v; break; }
+    if (target == nullptr)
+        for (auto& v : voices)
+            if (v.released && (target == nullptr || v.env < target->env))
+                target = &v;
+    if (target == nullptr)
+        target = &voices[0];
+
+    const auto& sl = slots[slotIndex];
     const float sens = juce::jlimit (0.0f, 1.0f, pVelocity->load());
-
-    voice.playing = true;
-    voice.released = false;
-    voice.envLevel = 0.0f;
-    voice.pos = juce::jlimit (0.0f, 0.9f, pStart->load()) * (double) len;
-    voice.note = note;
-    voice.velocityGain = 1.0f - sens + sens * juce::jlimit (0.0f, 1.0f, velocity);
-    voice.noteRatio = ratioFor (activeMidi, note);
+    Voice v;
+    v.playing = true;
+    v.held = note >= 0;
+    v.note = note;
+    v.slot = slotIndex;
+    v.wantSlot = wantSlot != slotIndex ? wantSlot : -1;
+    v.velocityGain = 1.0f - sens + sens * juce::jlimit (0.0f, 1.0f, velocity);
+    v.t = juce::jlimit (0.0f, 0.9f, pStart->load()) * (double) sl.cur.size() / ratioFor (sl.curMidi, note);
+    v.age = ++voiceCounter;
+    *target = v;
 }
 
-void LatentAudioVSTAudioProcessor::releaseVoice()
+void LatentAudioVSTAudioProcessor::releaseVoicesForNote (int note)
 {
-    if (voice.playing)
-        voice.released = true;
+    const bool latch = pLatch->load() > 0.5f;
+    for (auto& v : voices)
+    {
+        if (v.playing && v.note == note && v.held)
+        {
+            v.held = false;
+            if (! latch)
+                v.released = true;
+        }
+    }
 }
 
-void LatentAudioVSTAudioProcessor::finishCrossfade()
+void LatentAudioVSTAudioProcessor::releaseAllVoices()
 {
-    // The incoming buffer may play at a different speed (it was decoded at the held
-    // note instead of being resampled to it): keep the same point in time.
-    std::swap (activeAudio, incomingAudio);
-    voice.pos = voice.pos / voice.noteRatio * incomingRatio;
-    voice.noteRatio = incomingRatio;
-    std::swap (activeMidi, incomingMidi);
-    crossfading = false;
-    crossfadePos = 0.0f;
+    for (auto& v : voices)
+    {
+        v.held = false;
+        if (v.playing)
+            v.released = true;
+    }
 }
 
-void LatentAudioVSTAudioProcessor::renderVoice (float* out, int startSample, int endSample, double baseSpeed)
+void LatentAudioVSTAudioProcessor::renderVoices (float* out, int startSample, int endSample, double baseSpeed)
 {
-    if (startSample >= endSample || (! voice.playing && stealGain <= 0.0f))
+    const int n = endSample - startSample;
+    if (n <= 0)
         return;
 
     const bool latch = pLatch->load() > 0.5f;
@@ -1048,113 +1328,131 @@ void LatentAudioVSTAudioProcessor::renderVoice (float* out, int startSample, int
     const double seamFrac = juce::jlimit (0.0f, 0.5f, pLoopXfade->load());
     const float attackInc = (float) (1.0 / (kAttackSeconds * hostSampleRate));
     const float releaseDec = (float) (1.0 / (kReleaseSeconds * hostSampleRate));
+    const float fastDec = (float) (1.0 / (kStealFadeSeconds * hostSampleRate));
+    const float switchInc = (float) (1.0 / (kSwapFadeSeconds * hostSampleRate));
 
-    const float* data = nullptr;
-    int len = 0;
-    double loopStart = 0.0, loopEnd = 0.0;
-    auto refresh = [&]
+    struct Region { double start, end; };
+    auto regionFor = [&] (int len)
     {
-        data = activeAudio.data();
-        len = (int) activeAudio.size();
         const double minLen = std::max (64.0, 0.01 * len);
-        loopStart = startFrac * len;
-        loopEnd = std::min ((double) len, std::max (endFrac * len, loopStart + minLen));
-        loopStart = std::max (0.0, std::min (loopStart, loopEnd - minLen));
+        double ls = startFrac * len;
+        const double le = std::min ((double) len, std::max (endFrac * len, ls + minLen));
+        ls = std::max (0.0, std::min (ls, le - minLen));
+        return Region { ls, le };
     };
-    refresh();
 
-    if (len < 4)
+    // One buffer read at source time t, played at `ratio`, with the loop seam.
+    auto readBuf = [&] (const std::vector<float>& b, double ratio, double t) -> float
     {
-        voice.playing = false;
-        stealGain = 0.0f;
-        return;
-    }
-
-    for (int i = startSample; i < endSample; ++i)
-    {
-        float sample = 0.0f;
-
-        if (voice.playing)
+        const int len = (int) b.size();
+        if (len < 4)
+            return 0.0f;
+        const auto r = regionFor (len);
+        double p = t * ratio;
+        if (latch && p >= r.end)
+            p = r.start + std::fmod (p - r.start, r.end - r.start);
+        if (p >= (double) len)
+            return 0.0f;
+        float sig = readHermite (b.data(), len, p);
+        if (latch && seamFrac > 0.001)
         {
-            const double speed = baseSpeed * voice.noteRatio;
-            float sig = 0.0f;
+            const double seam = (r.end - r.start) * seamFrac;
+            const double toEnd = r.end - p;
+            if (toEnd < seam && toEnd >= 0.0)
+            {
+                const float w = (float) ((seam - toEnd) / seam);
+                sig = sig * (1.0f - w) + readHermite (b.data(), len, r.start + (seam - toEnd)) * w;
+            }
+        }
+        return sig;
+    };
 
-            if (voice.pos >= loopEnd)
+    for (auto& v : voices)
+    {
+        if (! v.playing)
+            continue;
+
+        const Slot& S = slots[v.slot];
+        if (S.cur.size() < 4)
+        {
+            v.playing = false;
+            continue;
+        }
+        const double rCur = ratioFor (S.curMidi, v.note);
+        const double rPrev = ratioFor (S.prevMidi, v.note);
+        const Slot* F = v.fromSlot >= 0 ? &slots[v.fromSlot] : nullptr;
+        const double rFCur = F != nullptr ? ratioFor (F->curMidi, v.note) : 1.0;
+        const double rFPrev = F != nullptr ? ratioFor (F->prevMidi, v.note) : 1.0;
+        const auto region = regionFor ((int) S.cur.size());
+
+        float sFade = S.fade;
+        float fFade = F != nullptr ? F->fade : 1.0f;
+
+        for (int i = startSample; i < endSample; ++i)
+        {
+            // Loop / end handling on the voice's own buffer.
+            const double p = v.t * rCur;
+            if (p >= region.end)
             {
                 if (latch)
-                    voice.pos = loopStart + std::fmod (voice.pos - loopStart, loopEnd - loopStart);
+                    v.t = (region.start + std::fmod (p - region.start, region.end - region.start)) / rCur;
                 else
-                    voice.released = true; // one-shot reached its end
+                    v.released = true; // one-shot reached its end
             }
 
-            if (voice.pos < loopEnd)
+            float sig = readBuf (S.cur, rCur, v.t);
+            if (sFade < 1.0f)
             {
-                sig = readHermite (data, len, voice.pos);
-
-                // Loop seam: blend the loop start into the end so the wrap is seamless.
-                if (latch && seamFrac > 0.001)
+                sig = readBuf (S.prev, rPrev, v.t) * (1.0f - sFade) + sig * sFade;
+                sFade = std::min (1.0f, sFade + S.fadeInc);
+            }
+            if (F != nullptr)
+            {
+                float from = readBuf (F->cur, rFCur, v.t);
+                if (fFade < 1.0f)
                 {
-                    const double seam = (loopEnd - loopStart) * seamFrac;
-                    const double toEnd = loopEnd - voice.pos;
-                    if (toEnd < seam)
-                    {
-                        const float w = (float) ((seam - toEnd) / seam);
-                        sig = sig * (1.0f - w) + readHermite (data, len, loopStart + (seam - toEnd)) * w;
-                    }
+                    from = readBuf (F->prev, rFPrev, v.t) * (1.0f - fFade) + from * fFade;
+                    fFade = std::min (1.0f, fFade + F->fadeInc);
                 }
-
-                if (crossfading)
+                sig = from * (1.0f - v.switchFade) + sig * v.switchFade;
+                v.switchFade += switchInc;
+                if (v.switchFade >= 1.0f)
                 {
-                    const int inLen = (int) incomingAudio.size();
-                    const double inPos = voice.pos / voice.noteRatio * incomingRatio;
-                    const float next = inLen > 3 ? readHermite (incomingAudio.data(), inLen, inPos) : 0.0f;
-                    sig = sig * (1.0f - crossfadePos) + next * crossfadePos;
-                    crossfadePos += crossfadeInc;
-                    if (crossfadePos >= 1.0f)
-                    {
-                        finishCrossfade();
-                        refresh();
-                        if (len < 4) { voice.playing = false; break; }
-                    }
+                    v.switchFade = 1.0f;
+                    v.fromSlot = -1;
+                    v.wantSlot = -1;
+                    F = nullptr;
                 }
             }
 
-            if (voice.released)
+            if (v.released)
             {
-                voice.envLevel -= releaseDec;
-                if (voice.envLevel <= 0.0f)
+                v.env -= v.fastRelease ? fastDec : releaseDec;
+                if (v.env <= 0.0f)
                 {
-                    voice.envLevel = 0.0f;
-                    voice.playing = false;
-                    if (crossfading)
-                    {
-                        finishCrossfade();
-                        refresh();
-                    }
+                    v.env = 0.0f;
+                    v.playing = false;
+                    break;
                 }
             }
-            else if (voice.envLevel < 1.0f)
+            else if (v.env < 1.0f)
             {
-                voice.envLevel = std::min (1.0f, voice.envLevel + attackInc);
+                v.env = std::min (1.0f, v.env + attackInc);
             }
 
-            sample = sig * voice.envLevel * voice.velocityGain;
-            voice.pos += speed;
+            out[i] += sig * v.env * v.velocityGain;
+            v.t += baseSpeed;
         }
-
-        if (stealGain > 0.0f)
+        if (! v.playing)
         {
-            if (stealPos < (double) len)
-                sample += readHermite (data, len, stealPos) * stealGain;
-            stealPos += stealSpeed;
-            stealGain = std::max (0.0f, stealGain - stealInc);
+            v.fromSlot = v.wantSlot = -1;
         }
-
-        out[i] += sample;
-
-        if (! voice.playing && stealGain <= 0.0f)
-            break;
     }
+
+    // Slot fades advance once per segment (every voice above read them locally).
+    for (auto& sl : slots)
+        if (sl.fade < 1.0f)
+            sl.fade = std::min (1.0f, sl.fade + sl.fadeInc * (float) n);
 }
 
 //==============================================================================

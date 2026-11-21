@@ -93,8 +93,8 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 ### Layout
 - **Header**: model name and status (sound count, CPU/GPU), *Load Model...* and *Unload*. You can also **drag a model folder (or its .onnx / .json) onto the plugin** to load it. Loading runs in the background, so the DAW never freezes.
 - **Toolbar**: *Play on Note*, *Hold*, *Snap*, *Key Track*, *Random*, *Center*, MIDI activity light, cursor coordinates, *Reset*.
-- **Sound map**: click/drag to play, right/middle-drag to pan, mouse wheel zooms toward the pointer, double-click resets the view. Hover a dot to see its name. Orange lines show which sounds the cursor is blending and how strongly.
-- **Waveform**: the generated sound, the Start-End region that plays, and the playhead.
+- **Sky map**: every star is a sound - colour = brightness (ember red = dark, blue-white = bright), size = how long it rings. The nebula behind the stars is the model's sound *between* them (decoded at export), so you can see where bright, dark or loud regions are before clicking. Moving between stars follows a smooth field: no jumps where the nearest sounds change. Click/drag to play, right/middle-drag to pan, mouse wheel zooms toward the pointer, double-click resets the view. Hover a star to see its name; the nearest sound is named top-left. (Older model folders without a sky map show plain dots and orange blend lines; upgrade them with `scripts/upgrade_map.py` in the LatentAudio repo.)
+- **Waveform**: the generated sound, the Start-End region that plays, and the playhead. **Drag it onto a DAW track** to use the sound as audio (written as a WAV to `Documents/LatentAudio/Exports`); right-click to *Save as WAV...*.
 - **Knobs**: double-click any knob to reset it; hover for a description.
 
 ### Parameter Controls
@@ -104,6 +104,7 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 - **Tune**: fine tune (-100 to +100 cents)
 - **Loop X-Fade**: crossfade at the loop point when Hold is on
 - **Root**: with Key Track on, the MIDI note that plays at the original pitch
+- **Voices**: how many notes play at once (1-8; 1 = mono, a new note cuts the last one). With a pitched model and Key Track, each note of a chord is generated at its own pitch
 
 #### Filter
 - **Cutoff** / **Reso**: 4-pole low-pass with resonance, smoothed so automation doesn't zipper. The graph shows the real response in dB.
@@ -136,7 +137,7 @@ Sounds play at the model's sample rate regardless of the DAW's (44.1, 48, 96 kHz
 Decoding runs on CUDA or DirectML when available and falls back to CPU otherwise.
 
 ### MIDI Integration
-Sample-accurate note timing, velocity sensitivity, optional key tracking. Overlapping notes are handled legato: releasing an old note does not cut a newer one.
+Sample-accurate note timing, velocity sensitivity, optional key tracking, up to 8-voice polyphony (repeating a note retriggers it; over the limit the oldest note fades out quickly). Pitched models decode every held note at its own pitch on the inference thread; repeated notes at the same position reuse the decode.
 
 ### Envelope
 A fixed, very short attack/release gate (1 ms / 20 ms) declicks note starts and stops; the generated sample's own shape is preserved.

@@ -9,11 +9,20 @@ SETUP
   (about 1-3 GB). Several instances using the same model share one copy.
 - Uses the GPU (CUDA, then DirectML) when available, otherwise the CPU. The header shows which.
 
-PLAYING
-- Click the map to play a sound, drag to morph between sounds while it plays.
-- Orange lines show which sounds the cursor is blending (thicker = stronger).
+PLAYING - THE SKY MAP
+- Every star is a sound. Colour = brightness (ember red = dark, blue-white = bright),
+  size = how long it rings. The glowing nebula shows what the model sounds like BETWEEN the
+  stars, so you can aim for "bright and loud" before clicking.
+- Click the map to play a sound, drag to morph smoothly while it plays. Every spot is a sound.
+- The nearest sound's name is shown top-left; hover a star to see its name.
 - Right/middle drag pans, mouse wheel zooms toward the mouse, double-click resets the view.
-- Hover a dot to see its name.
+- Older model folders (without a sky map) show plain cyan dots and orange blend lines.
+  Upgrade them with:  python scripts/upgrade_map.py <model folder>   (in the LatentAudio repo)
+
+USING THE SOUND IN YOUR DAW
+- Drag the waveform onto a track (in FL: onto the playlist or a channel) to drop the current
+  sound in as audio. It is saved as a WAV in Documents\LatentAudio\Exports (the Start-End region).
+- Right-click the waveform: Save as WAV..., save to the exports folder, or open that folder.
 
 BUTTONS
 - PLAY ON NOTE: only MIDI notes play sounds. Moving the cursor (or automating it) changes the sound
@@ -25,6 +34,8 @@ BUTTONS
     generates the actual note you play. You hear the note instantly, and the model's real version
     fades in a moment later. ROOT is not used.
   * Other models: the sound is transposed; ROOT is the note that plays at original pitch.
+- VOICES: how many notes can play at once (chords). 1 = mono: a new note cuts the last one.
+  With a pitched model and Key Track, every note of a chord is generated at its own pitch.
 - RANDOM: jumps to a random sound.
 - CENTER: resets the view and puts the cursor in the middle of the map.
 - RESET: puts all knobs back to default (keeps the position).

@@ -21,8 +21,9 @@
 #include "SoundMap.h"
 
 //==============================================================================
-// 2D sound map ("nebula"). Left click/drag picks a position, right/middle drag
-// pans, wheel zooms toward the mouse, double-click resets the view.
+// The sky map. Sounds are stars (colour = brightness, size = length); sky maps
+// also show the model's sound between the stars as a nebula. Left click/drag picks
+// a position, right/middle drag pans, wheel zooms toward the mouse, double-click resets.
 class NebulaComponent : public juce::Component
 {
 public:
@@ -55,6 +56,8 @@ public:
 private:
     void pickAt (juce::Point<float> screenPos, bool isDrag);
     void rebuildPointsLayer();
+    static juce::Colour starColour (float brightness);
+    static juce::String displayName (const SoundPoint& p, int index);
     void updateNeighbours();
     bool isPanGesture (const juce::MouseEvent& e) const;
 
