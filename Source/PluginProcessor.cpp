@@ -320,6 +320,66 @@ void LatentAudioVSTAudioProcessor::copyDisplayWaveform (std::vector<float>& dest
     dest = displayWaveform;
 }
 
+std::vector<float> LatentAudioVSTAudioProcessor::renderForExport() const
+{
+    std::vector<float> src;
+    copyDisplayWaveform (src);
+    const int len = (int) src.size();
+    if (len < 4)
+        return {};
+    const double sr = (double) juce::jmax (8000, modelSampleRate.load());
+
+    // Start/End region, exactly as the voices pick it.
+    const double minLen = std::max (64.0, 0.01 * len);
+    double ls = (double) juce::jlimit (0.0f, 0.9f, pStart->load()) * len;
+    const double le = std::min ((double) len, std::max ((double) juce::jlimit (0.1f, 1.0f, pEnd->load()) * len, ls + minLen));
+    ls = std::max (0.0, std::min (ls, le - minLen));
+
+    // Rate + Tune (same resampler as playback).
+    const double speed = (double) pRate->load() * std::pow (2.0, (double) pTune->load() / 1200.0);
+    const int bodyLen = (int) std::floor ((le - ls) / std::max (0.01, speed));
+    if (bodyLen < 4)
+        return {};
+    const int tailLen = (int) (0.25 * sr); // let the filter ring out; trimmed below
+    std::vector<float> out ((size_t) (bodyLen + tailLen), 0.0f);
+    for (int i = 0; i < bodyLen; ++i)
+        out[(size_t) i] = readHermite (src.data(), len, ls + (double) i * speed);
+
+    // Same declick as a voice: 1 ms attack; a short fade if End cuts the sound.
+    const int attack = juce::jmax (1, (int) (kAttackSeconds * sr));
+    for (int i = 0; i < std::min (attack, bodyLen); ++i)
+        out[(size_t) i] *= (float) i / (float) attack;
+    if (le < (double) len - 1.0)
+    {
+        const int fade = std::min (bodyLen / 4, (int) (kReleaseSeconds * sr));
+        for (int i = 0; i < fade; ++i)
+            out[(size_t) (bodyLen - 1 - i)] *= (float) i / (float) fade;
+    }
+
+    // 4-pole low-pass (same topology and settings as processBlock) and output level.
+    juce::dsp::StateVariableTPTFilter<float> fa, fb;
+    const juce::dsp::ProcessSpec spec { sr, 512, 1 };
+    for (auto* f : { &fa, &fb })
+    {
+        f->prepare (spec);
+        f->setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+        f->setCutoffFrequency (juce::jlimit (20.0f, (float) (0.45 * sr), pCutoff->load()));
+    }
+    fa.setResonance (0.5412f);
+    fb.setResonance (1.3066f + juce::jlimit (0.0f, 1.0f, pReso->load()) * 7.0f);
+    const float gain = pGain->load() * pMix->load();
+    for (auto& s : out)
+        s = fb.processSample (0, fa.processSample (0, s)) * gain;
+
+    // Drop the silent part of the tail.
+    const float floor = juce::Decibels::decibelsToGain (-90.0f);
+    int last = (int) out.size() - 1;
+    while (last > bodyLen && std::abs (out[(size_t) last]) < floor)
+        --last;
+    out.resize ((size_t) last + 1);
+    return out;
+}
+
 //==============================================================================
 // Inference thread
 void LatentAudioVSTAudioProcessor::serviceInference()

@@ -114,6 +114,11 @@ public:
     uint32_t getMidiActivityCount() const { return midiActivityCount.load(); }
     uint32_t getDisplayVersion() const { return displayVersion.load(); }
     void copyDisplayWaveform (std::vector<float>& dest) const;
+
+    // The current sound as you hear it, for export: Start/End, Rate + Tune, the
+    // low-pass filter and Gain x Level applied (one-shot, full velocity). Mono, at
+    // the model's sample rate. Empty if there is no sound.
+    std::vector<float> renderForExport() const;
     int getModelSampleRate() const { return modelSampleRate.load(); }
     bool isPitchedModel() const { return mapHasPitch.load(); }
     // Pitched models with Key Track: notes the model is asked to generate.

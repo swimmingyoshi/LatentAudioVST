@@ -20,7 +20,8 @@
 
 WaveformComponent::WaveformComponent()
 {
-    setTooltip ("Drag onto a track in your DAW to use this sound. Right-click to save it as a WAV.");
+    setTooltip ("Drag onto a track in your DAW to use this sound (with Rate, Tune, Start/End, Filter and Gain "
+                "applied). Right-click to save it as a WAV.");
     setMouseCursor (juce::MouseCursor::DraggingHandCursor);
 }
 
@@ -85,6 +86,13 @@ bool WaveformComponent::writeWav (const juce::File& file, const std::vector<floa
     return true;
 }
 
+bool WaveformComponent::writeExport (const juce::File& file, juce::String& error) const
+{
+    if (renderExport != nullptr)
+        return writeWav (file, renderExport(), sampleRate, 0.0f, 1.0f, error);
+    return writeWav (file, waveform, sampleRate, regionStart, regionEnd, error);
+}
+
 juce::File WaveformComponent::exportToFolder (juce::String& error) const
 {
     auto stem = exportName != nullptr ? exportName() : juce::String();
@@ -93,7 +101,7 @@ juce::File WaveformComponent::exportToFolder (juce::String& error) const
         stem = "sound";
     const auto stamp = juce::Time::getCurrentTime().formatted ("%Y%m%d_%H%M%S");
     const auto file = exportFolder().getNonexistentChildFile ("LatentAudio_" + stem + "_" + stamp, ".wav", false);
-    if (! writeWav (file, waveform, sampleRate, regionStart, regionEnd, error))
+    if (! writeExport (file, error))
         return {};
     return file;
 }
@@ -140,8 +148,7 @@ void WaveformComponent::mouseDown (const juce::MouseEvent& e)
                         if (me == nullptr || target == juce::File())
                             return;
                         juce::String err;
-                        if (! writeWav (target.withFileExtension ("wav"), me->waveform, me->sampleRate,
-                                        me->regionStart, me->regionEnd, err))
+                        if (! me->writeExport (target.withFileExtension ("wav"), err))
                             juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Save failed", err);
                     });
             }

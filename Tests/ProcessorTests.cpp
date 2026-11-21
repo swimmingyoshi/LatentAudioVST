@@ -338,6 +338,34 @@ public:
             expectEquals (r.proc.getActiveVoiceCount(), 1);
         }
 
+        beginTest ("export applies the plugin's settings (gain, rate, start/end, filter)");
+        {
+            Rig r;
+            r.proc.injectDecodedAudio (sine (8000.0, 44100.0, 44100));
+            const auto plain = r.proc.renderForExport();
+            expect (plain.size() >= 44100 && plain.size() < 44100 + 11100);
+            const float base = rms (plain, 2000, 40000);
+            expectWithinAbsoluteError (base, 0.5f * 0.7071f, 0.03f); // default 10 kHz cutoff barely touches 8 kHz
+
+            r.set ("outputGain", 0.5f);
+            expectWithinAbsoluteError (rms (r.proc.renderForExport(), 2000, 40000), base * 0.5f, 0.02f);
+            r.set ("outputGain", 1.0f);
+
+            r.set ("playbackRate", 2.0f);
+            const auto fast = r.proc.renderForExport();
+            expect (fast.size() >= 22050 && fast.size() < 22050 + 11100, "double speed halves the length");
+            r.set ("playbackRate", 1.0f);
+
+            r.set ("sampleLength", 0.5f);
+            expect (r.proc.renderForExport().size() < 22050 + 11100, "End trims the sound");
+            r.set ("sampleLength", 1.0f);
+
+            r.set ("filterCutoff", 500.0f);
+            const auto dark = r.proc.renderForExport();
+            expect (rms (dark, 2000, 40000) < base * 0.01f, "low-pass removes an 8 kHz tone");
+            expect (allFinite (dark));
+        }
+
         beginTest ("filter: stable at full resonance, correct response at zero");
         {
             Rig r;

@@ -153,6 +153,7 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     addAndMakeVisible (waveform);
     nebula.setComponentID ("nebula");
     waveform.setComponentID ("waveform");
+    waveform.renderExport = [this] { return processor.renderForExport(); };
     waveform.exportName = [this]
     {
         juce::String name;

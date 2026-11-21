@@ -33,6 +33,9 @@ public:
     void setSampleRate (int rate) { sampleRate = rate; }
     // Name stem for exported files (e.g. the nearest sound's label).
     std::function<juce::String()> exportName;
+    // The sound with the plugin's settings applied (what you hear). When set, exports
+    // use it as-is; otherwise they write the raw Start-End region.
+    std::function<std::vector<float>()> renderExport;
 
     // The Start-End region as a 24-bit WAV. Returns false (with a reason) on failure.
     static bool writeWav (const juce::File& file, const std::vector<float>& audio, int sampleRate,
@@ -40,6 +43,8 @@ public:
     static juce::File exportFolder();
     // Writes the current sound to the export folder; returns the file (or {} on failure).
     juce::File exportToFolder (juce::String& error) const;
+    // Writes what exports contain (rendered sound, or the raw region) to `file`.
+    bool writeExport (const juce::File& file, juce::String& error) const;
     bool hasSound() const { return ! waveform.empty(); }
 
     void mouseDown (const juce::MouseEvent&) override;
