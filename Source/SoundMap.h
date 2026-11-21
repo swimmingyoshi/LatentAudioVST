@@ -84,6 +84,25 @@ struct SoundMapData
     // inverse-distance-weighted blend of the kNearest points. Exactly on a sound: that sound.
     std::vector<float> interpolate (float x, float y, int kNearest = 5) const;
 
+    // Typical distance between neighbouring sounds (median distance to the 5th
+    // nearest one), in map units. Sets the size of the blend.
+    float spacing = 0.1f;
+
+    // The latent with a user-chosen blend width. blend <= 0: interpolate() (the map's
+    // own blend, ~10 nearby sounds). blend 0..1 widens to a Gaussian mix of more and
+    // more sounds; the timbre part is rescaled to the sounds' typical size so a wide
+    // mix does not average out to a dull, quiet middle.
+    std::vector<float> interpolateBlend (float x, float y, float blend) const;
+
+    // Each sound's share of the blend at (x, y), largest first (at most maxCount),
+    // and how many sounds effectively take part (1 / sum of squared shares).
+    struct BlendInfo
+    {
+        std::vector<std::pair<int, float>> top;
+        float effectiveCount = 0.0f;
+    };
+    BlendInfo blendInfo (float x, float y, float blend, int maxCount) const;
+
     // Indices of the kNearest points, closest first.
     std::vector<int> nearestIndices (float x, float y, int kNearest) const;
 

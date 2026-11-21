@@ -110,6 +110,10 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     // Version 3
     p.push_back (std::make_unique<juce::AudioParameterInt> (PID { "polyphony", 3 }, "Voices", 1, 8, 8));
 
+    // Version 4
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "blend", 4 }, "Blend", Range (0.0f, 1.0f), 0.0f,
+        floatAttr (formatPercent)));
+
     parameters = std::make_unique<juce::AudioProcessorValueTreeState> (
         *this, nullptr, "PARAMETERS", juce::AudioProcessorValueTreeState::ParameterLayout (p.begin(), p.end()));
 
@@ -120,10 +124,11 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     pPosX = raw ("positionX");        pPosY = raw ("positionY");      pInferenceRate = raw ("inferenceRate");
     pLatch = raw ("latchMode");       pTriggerOnMidi = raw ("triggerOnMidi");
     pKeyTrack = raw ("keyTrack");     pRootNote = raw ("rootNote");   pVelocity = raw ("velocitySens");
-    pPolyphony = raw ("polyphony");
+    pPolyphony = raw ("polyphony");     pBlend = raw ("blend");
 
     parameters->addParameterListener ("positionX", this);
     parameters->addParameterListener ("positionY", this);
+    parameters->addParameterListener ("blend", this);
 
     {
         const juce::ScopedLock sl (statusLock);
@@ -137,6 +142,7 @@ LatentAudioVSTAudioProcessor::~LatentAudioVSTAudioProcessor()
 {
     parameters->removeParameterListener ("positionX", this);
     parameters->removeParameterListener ("positionY", this);
+    parameters->removeParameterListener ("blend", this);
     inferenceThread.stopThread (4000);
     // Loading a model can't be interrupted; wait so the job never outlives us.
     loaderPool.removeAllJobs (true, 60000);
@@ -173,6 +179,8 @@ void LatentAudioVSTAudioProcessor::parameterChanged (const juce::String& id, flo
 {
     if (id == "positionX" || id == "positionY")
         applyPositionParameters();
+    else if (id == "blend")
+        requestInference (false); // re-decode; the next note (and held notes) use the new mix
 }
 
 void LatentAudioVSTAudioProcessor::applyPositionParameters()
@@ -389,7 +397,7 @@ bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, float wantMidi, s
     if (map == nullptr || map->points.empty())
         return false;
 
-    auto latent = map->interpolate (x, y);
+    auto latent = map->interpolateBlend (x, y, pBlend->load());
     outMidi = std::numeric_limits<float>::quiet_NaN();
     if (map->hasPitch())
     {

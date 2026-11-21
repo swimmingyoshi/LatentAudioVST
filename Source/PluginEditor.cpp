@@ -21,8 +21,11 @@ using namespace LatentPalette;
 
 namespace
 {
-    const juce::Colour sectionAccents[] = { accentViolet(), accentCyan(), juce::Colour (0xfff06080) };
-    const char* sectionNames[] = { "PLAYBACK", "FILTER", "OUTPUT" };
+    // Sections, left to right. Each knob takes its section's accent colour.
+    enum Section { morphSection, playbackSection, filterSection, outputSection, numSections };
+    const juce::Colour sectionAccents[] = { accentAmber(), accentViolet(), accentCyan(), juce::Colour (0xfff06080) };
+    const char* sectionNames[] = { "SOUND", "PLAYBACK", "FILTER", "OUTPUT" };
+    const int sectionUnits[] = { 2, 5, 3, 4 }; // relative widths
     const juce::Colour errorColour (0xfff06080);
 }
 
@@ -162,25 +165,30 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
         return name;
     };
 
-    // --- Knobs ---
-    addKnob ("playbackRate", "Rate", "Playback speed (also changes pitch).", 0);
-    addKnob ("fineTune", "Tune", "Fine tune in cents.", 0);
-    addKnob ("crossfade", "Loop X-Fade", "Crossfade at the loop point when Hold is on.", 0);
-    rootKnob = &addKnob ("rootNote", "Root", "With Key Track on, this note plays at the original pitch.", 0);
-    addKnob ("polyphony", "Voices", "How many notes can play at once (1 = mono: a new note cuts the last).", 0);
+    // --- Knobs ---  (drag up/right, Shift = fine, wheel, double-click = reset)
+    addKnob ("blend", "Blend",
+             "How many sounds are mixed into the one you hear. 0% = the map's own blend (about ten nearby sounds, "
+             "and exactly the sound when you are on a star). Turn it up to mix in more and more distant sounds "
+             "for new hybrids. The map shows which sounds are in the mix.", morphSection);
+
+    addKnob ("playbackRate", "Rate", "Playback speed (also changes pitch).", playbackSection);
+    addKnob ("fineTune", "Tune", "Fine tune in cents.", playbackSection).slider.getProperties().set ("bipolar", true);
+    addKnob ("crossfade", "Loop X-Fade", "Crossfade at the loop point when Hold is on.", playbackSection);
+    rootKnob = &addKnob ("rootNote", "Root", "With Key Track on, this note plays at the original pitch.", playbackSection);
+    addKnob ("polyphony", "Voices", "How many notes can play at once (1 = mono: a new note cuts the last).", playbackSection);
 
     addAndMakeVisible (filterGraph);
-    addKnob ("filterCutoff", "Cutoff", "Low-pass cutoff frequency.", 1);
-    addKnob ("filterResonance", "Reso", "Low-pass resonance.", 1);
+    addKnob ("filterCutoff", "Cutoff", "Low-pass cutoff frequency.", filterSection);
+    addKnob ("filterResonance", "Reso", "Low-pass resonance.", filterSection);
 
-    addKnob ("sampleStart", "Start", "Where playback starts in the sound.", 2);
-    addKnob ("sampleLength", "End", "Where playback ends (and loops, with Hold).", 2);
-    addKnob ("velocitySens", "Velocity", "How much MIDI velocity affects volume.", 2);
-    addKnob ("outputGain", "Gain", "Output level.", 2);
+    addKnob ("sampleStart", "Start", "Where playback starts in the sound.", outputSection);
+    addKnob ("sampleLength", "End", "Where playback ends (and loops, with Hold).", outputSection);
+    addKnob ("velocitySens", "Velocity", "How much MIDI velocity affects volume.", outputSection);
+    addKnob ("outputGain", "Gain", "Output level.", outputSection);
 
     setResizable (true, true);
-    setResizeLimits (760, 540, 2400, 1600);
-    setSize (980, 700);
+    setResizeLimits (860, 580, 2400, 1600);
+    setSize (1080, 720);
 
     timerCallback();
     startTimerHz (30);
@@ -197,7 +205,8 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
 {
     auto knob = std::make_unique<Knob>();
     knob->section = section;
-    knob->slider.setTooltip (tooltip);
+    knob->slider.setTooltip (tooltip + "\n(Drag up/right, Shift for fine, double-click to reset.)");
+    knob->slider.setColour (juce::Slider::rotarySliderFillColourId, sectionAccents[section]);
     knob->slider.setComponentID (paramId);
     knob->slider.setPopupDisplayEnabled (false, false, nullptr);
     knob->attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
@@ -209,10 +218,11 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
     knob->label.setText (name, juce::dontSendNotification);
     knob->label.setJustificationType (juce::Justification::centred);
     knob->label.setTooltip (tooltip);
+    knob->label.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (knob->slider);
     addAndMakeVisible (knob->label);
     // After parenting, so the value box is created with our look-and-feel.
-    knob->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 76, 18);
+    knob->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
     knobs.push_back (std::move (knob));
     return *knobs.back();
 }
@@ -272,15 +282,28 @@ void LatentAudioVSTAudioProcessorEditor::paint (juce::Graphics& g)
     for (size_t i = 0; i < sectionAreas.size(); ++i)
     {
         const auto fb = sectionAreas[i].toFloat();
-        g.setColour (panelBg());
+        // Panel with a faint wash of the section colour at the top.
+        g.setGradientFill (juce::ColourGradient (panelBg().interpolatedWith (sectionAccents[i], 0.07f), 0.0f, fb.getY(),
+                                                 panelBg(), 0.0f, fb.getY() + fb.getHeight() * 0.6f, false));
         g.fillRoundedRectangle (fb, 8.0f);
-        g.setColour (sectionAccents[i]);
-        g.fillRoundedRectangle (fb.getX() + 10.0f, fb.getY() + 4.0f, fb.getWidth() - 20.0f, 2.5f, 1.2f);
         g.setColour (borderCol());
         g.drawRoundedRectangle (fb.reduced (0.5f), 8.0f, 1.0f);
-        g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-        g.setColour (sectionAccents[i].withAlpha (0.9f));
-        g.drawText (sectionNames[i], sectionAreas[i].withHeight (24).withTrimmedTop (8), juce::Justification::centred);
+
+        // Title with short accent rules either side.
+        const auto title = juce::String (sectionNames[i]);
+        const auto font = juce::Font (juce::FontOptions (10.5f, juce::Font::bold)).withExtraKerningFactor (0.12f);
+        g.setFont (font);
+        const float tw = juce::GlyphArrangement::getStringWidth (font, title);
+        const float ty = fb.getY() + 13.0f, cx = fb.getCentreX();
+        g.setColour (sectionAccents[i].withAlpha (0.95f));
+        g.drawText (title, juce::Rectangle<float> (cx - tw * 0.5f - 4.0f, ty - 7.0f, tw + 8.0f, 14.0f), juce::Justification::centred);
+        const float rule = juce::jmin (36.0f, (fb.getWidth() - tw) * 0.5f - 18.0f);
+        if (rule > 4.0f)
+        {
+            g.setColour (sectionAccents[i].withAlpha (0.45f));
+            g.fillRoundedRectangle (cx - tw * 0.5f - 8.0f - rule, ty - 1.0f, rule, 2.0f, 1.0f);
+            g.fillRoundedRectangle (cx + tw * 0.5f + 8.0f, ty - 1.0f, rule, 2.0f, 1.0f);
+        }
     }
 }
 
@@ -322,7 +345,7 @@ void LatentAudioVSTAudioProcessorEditor::resized()
         auto t = area.removeFromTop (28);
         for (auto* b : { &playOnNoteToggle, &holdToggle, &snapToggle, &keyTrackToggle })
         {
-            b->setBounds (t.removeFromLeft (b == &playOnNoteToggle ? 100 : 78));
+            b->setBounds (t.removeFromLeft (b == &playOnNoteToggle ? 112 : (b == &keyTrackToggle ? 92 : 80)));
             t.removeFromLeft (6);
         }
         t.removeFromLeft (10);
@@ -344,29 +367,50 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     area.removeFromBottom (8);
     nebula.setBounds (area);
 
-    // Three sections: playback (5 knobs), filter (graph + 2 knobs), output (4 knobs)
-    const int unit = controls.getWidth() / 11;
-    sectionAreas[0] = controls.removeFromLeft (unit * 5).reduced (3, 0);
-    sectionAreas[1] = controls.removeFromLeft (unit * 3).reduced (3, 0);
-    sectionAreas[2] = controls.reduced (3, 0);
+    // Sections side by side: sound (blend), playback, filter (graph + 2), output.
+    int totalUnits = 0;
+    for (int u : sectionUnits) totalUnits += u;
+    const float unit = (float) controls.getWidth() / (float) totalUnits;
+    {
+        float x = (float) controls.getX();
+        for (int s = 0; s < numSections; ++s)
+        {
+            const float w = unit * (float) sectionUnits[s];
+            sectionAreas[(size_t) s] = juce::Rectangle<int> (juce::roundToInt (x), controls.getY(),
+                                                             juce::roundToInt (x + w) - juce::roundToInt (x), controls.getHeight()).reduced (3, 0);
+            x += w;
+        }
+    }
 
-    std::array<juce::Rectangle<int>, 3> inner;
-    for (size_t i = 0; i < 3; ++i)
+    std::array<juce::Rectangle<int>, numSections> inner;
+    for (size_t i = 0; i < inner.size(); ++i)
         inner[i] = sectionAreas[i].reduced (6, 0).withTrimmedTop (26).withTrimmedBottom (6);
 
-    filterGraph.setBounds (inner[1].removeFromLeft (inner[1].getWidth() / 3).reduced (2, 14));
+    filterGraph.setBounds (inner[filterSection].removeFromLeft (inner[filterSection].getWidth() / 3).reduced (2, 14));
 
-    std::array<int, 3> counts {};
+    // One cell per knob, then every knob gets the same size (the largest that fits all).
+    std::array<int, numSections> counts {};
     for (auto& k : knobs) ++counts[(size_t) k->section];
-    std::array<int, 3> placed {};
+    std::array<int, numSections> placed {};
+    std::vector<juce::Rectangle<int>> cells;
+    int knobSize = 1000;
     for (auto& k : knobs)
     {
         const auto s = (size_t) k->section;
         const int width = inner[s].getWidth() / juce::jmax (1, counts[s] - placed[s]);
-        auto cell = inner[s].removeFromLeft (width);
+        cells.push_back (inner[s].removeFromLeft (width));
         ++placed[s];
-        k->label.setBounds (cell.removeFromTop (16));
-        k->slider.setBounds (cell);
+        knobSize = juce::jmin (knobSize, cells.back().getWidth() - 6, cells.back().getHeight() - 16 - 20);
+    }
+    knobSize = juce::jlimit (24, 96, knobSize);
+    for (size_t i = 0; i < knobs.size(); ++i)
+    {
+        auto& k = knobs[i];
+        const auto cell = cells[i];
+        const int blockH = 16 + knobSize + 20;
+        auto block = cell.withSizeKeepingCentre (cell.getWidth(), blockH);
+        k->label.setBounds (block.removeFromTop (16));
+        k->slider.setBounds (block.withSizeKeepingCentre (juce::jmax (knobSize, 80), block.getHeight()));
     }
 }
 
@@ -407,6 +451,7 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
         nebula.setOverlayMessage ({});
 
     nebula.setSnapping (snapToggle.getToggleState());
+    nebula.setBlend (processor.getAPVTS().getRawParameterValue ("blend")->load());
     const auto cursor = processor.getCursor();
     nebula.setCursorPosition (cursor.x, cursor.y);
 

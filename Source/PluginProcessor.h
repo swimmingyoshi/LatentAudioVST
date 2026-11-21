@@ -186,6 +186,7 @@ private:
     std::atomic<float>* pRootNote = nullptr;
     std::atomic<float>* pVelocity = nullptr;
     std::atomic<float>* pPolyphony = nullptr;
+    std::atomic<float>* pBlend = nullptr;
 
     //==========================================================================
     SoundMap soundMap;

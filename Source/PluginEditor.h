@@ -40,6 +40,42 @@ private:
 };
 
 //==============================================================================
+// A knob that is easy to turn: drag up or right to raise it (about 200 px for the
+// whole range, wherever you grab it), hold Shift or Ctrl for fine steps, use the
+// mouse wheel, or double-click to reset.
+class LatentKnob : public juce::Slider
+{
+public:
+    LatentKnob() : juce::Slider (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow)
+    {
+        setRepaintsOnMouseActivity (true);
+        setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        juce::Slider::mouseDown (e); // starts the host gesture
+        lastDragPos = e.position;
+        dragProportion = valueToProportionOfLength (getValue());
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (! isEnabled() || e.mods.isPopupMenu())
+            return;
+        const float delta = (lastDragPos.y - e.position.y) + (e.position.x - lastDragPos.x);
+        lastDragPos = e.position;
+        const bool fine = e.mods.isShiftDown() || e.mods.isCommandDown() || e.mods.isCtrlDown();
+        dragProportion = juce::jlimit (0.0, 1.0, dragProportion + (double) delta / (fine ? 1200.0 : 200.0));
+        setValue (proportionOfLengthToValue (dragProportion), juce::sendNotificationSync);
+    }
+
+private:
+    juce::Point<float> lastDragPos;
+    double dragProportion = 0.0;
+};
+
+//==============================================================================
 class MidiLed : public juce::Component, public juce::SettableTooltipClient
 {
 public:
@@ -74,7 +110,7 @@ public:
 private:
     struct Knob
     {
-        juce::Slider slider { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
+        LatentKnob slider;
         juce::Label label;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
         int section = 0;
@@ -112,7 +148,7 @@ private:
     uint32_t lastMidiCount = 0;
     juce::uint32 midiLitUntil = 0;
     bool dragHover = false;
-    std::array<juce::Rectangle<int>, 3> sectionAreas;
+    std::array<juce::Rectangle<int>, 4> sectionAreas;
     juce::Rectangle<int> headerArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LatentAudioVSTAudioProcessorEditor)

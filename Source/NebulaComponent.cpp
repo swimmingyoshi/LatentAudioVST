@@ -20,7 +20,7 @@
 
 namespace
 {
-    constexpr int kBlendNeighbours = 5;   // must match SoundMapData::interpolate's default
+    constexpr int kShownNeighbours = 12;  // contributors drawn on the map
     constexpr float kHoverRadius = 10.0f; // px
 }
 
@@ -41,6 +41,15 @@ void NebulaComponent::setCursorPosition (float x, float y)
         return;
     cursorX = x;
     cursorY = y;
+    updateNeighbours();
+    repaint();
+}
+
+void NebulaComponent::setBlend (float newBlend)
+{
+    if (newBlend == blend)
+        return;
+    blend = newBlend;
     updateNeighbours();
     repaint();
 }
@@ -69,18 +78,13 @@ void NebulaComponent::updateNeighbours()
     if (map == nullptr || map->points.empty())
         return;
 
-    neighbours = map->nearestIndices (cursorX, cursorY, kBlendNeighbours);
-    float total = 0.0f;
-    for (int idx : neighbours)
+    const auto info = map->blendInfo (cursorX, cursorY, blend, kShownNeighbours);
+    for (const auto& [idx, share] : info.top)
     {
-        const auto& p = map->points[(size_t) idx];
-        const float d2 = juce::square (p.x - cursorX) + juce::square (p.y - cursorY);
-        const float w = d2 < 1.0e-10f ? 1.0e10f : 1.0f / d2;
-        neighbourWeights.push_back (w);
-        total += w;
+        neighbours.push_back (idx);
+        neighbourWeights.push_back (share);
     }
-    for (auto& w : neighbourWeights)
-        w /= total;
+    effectiveCount = info.effectiveCount;
 }
 
 //==============================================================================
@@ -235,34 +239,41 @@ void NebulaComponent::paint (juce::Graphics& g)
     {
         const auto c = mapToScreen (cursorX, cursorY);
 
-        // Older maps blend the nearest sounds: show which, and how much. Sky maps
-        // are a smooth field, so only the nearest sound is marked.
-        if (! map->hasField())
+        // The sounds being mixed at the cursor: line/dot strength = share of the blend.
+        if (! neighbours.empty())
         {
-            for (size_t i = 0; i < neighbours.size(); ++i)
+            const float top = juce::jmax (1.0e-6f, neighbourWeights.front());
+            for (size_t i = neighbours.size(); i-- > 0;)
             {
                 const auto& p = map->points[(size_t) neighbours[i]];
                 const auto s = mapToScreen (p.x, p.y);
-                const float w = neighbourWeights[i];
-                g.setColour (accentAmber().withAlpha (0.15f + 0.6f * w));
-                g.drawLine (c.x, c.y, s.x, s.y, 0.6f + 1.6f * w);
-                g.setColour (accentAmber().withAlpha (0.35f + 0.65f * w));
-                const float rr = 2.5f + 3.0f * w;
+                const float w = neighbourWeights[i] / top; // 1 = biggest contributor
+                g.setColour (accentAmber().withAlpha (0.10f + 0.45f * w));
+                g.drawLine (c.x, c.y, s.x, s.y, 0.5f + 1.3f * w);
+                g.setColour (accentAmber().withAlpha (0.30f + 0.65f * w));
+                const float rr = 1.8f + 2.6f * w;
                 g.fillEllipse (s.x - rr, s.y - rr, rr * 2.0f, rr * 2.0f);
             }
-        }
-        else if (! neighbours.empty())
-        {
-            const auto& p = map->points[(size_t) neighbours.front()];
-            const auto s = mapToScreen (p.x, p.y);
-            g.setColour (juce::Colours::white.withAlpha (0.55f));
-            g.drawEllipse (s.x - 5.0f, s.y - 5.0f, 10.0f, 10.0f, 1.0f);
 
-            // Nearest sound's name, bottom-left.
-            const auto name = displayName (p, neighbours.front());
+            // What is playing, top-left: the mix size and its biggest ingredients.
+            const int count = juce::jmax (1, juce::roundToInt (effectiveCount));
+            juce::String text;
+            if (count <= 1)
+                text = displayName (map->points[(size_t) neighbours.front()], neighbours.front());
+            else
+            {
+                text << "Mix of ~" << count << " sounds:  ";
+                for (size_t i = 0; i < juce::jmin<size_t> (3, neighbours.size()); ++i)
+                    text << (i > 0 ? ",  " : "") << displayName (map->points[(size_t) neighbours[i]], neighbours[i])
+                         << " " << juce::roundToInt (neighbourWeights[i] * 100.0f) << "%";
+            }
             g.setFont (juce::FontOptions (11.5f));
-            g.setColour (textPrimary().withAlpha (0.85f));
-            g.drawText (name, bounds.reduced (10.0f, 6.0f).removeFromTop (16.0f), juce::Justification::topLeft, true);
+            auto strip = bounds.reduced (8.0f, 6.0f).removeFromTop (18.0f);
+            strip.setWidth (juce::jmin (strip.getWidth(), juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), text) + 14.0f));
+            g.setColour (darkBg().withAlpha (0.65f));
+            g.fillRoundedRectangle (strip, 4.0f);
+            g.setColour (textPrimary().withAlpha (0.9f));
+            g.drawText (text, strip.reduced (7.0f, 0.0f), juce::Justification::centredLeft, true);
         }
 
         // Colour legend

@@ -79,63 +79,75 @@ public:
     }
 
     //==========================================================================
+    // Knob: thick arc in the slider's accent colour (with a soft glow), a raised
+    // body and a pointer. Brightens on hover/drag. "bipolar" property: arc from 12 o'clock.
     void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
                           float sliderPosProportional, float rotaryStartAngle,
-                          float rotaryEndAngle, juce::Slider&) override
+                          float rotaryEndAngle, juce::Slider& slider) override
     {
         using namespace LatentPalette;
 
-        auto centreX   = (float)x + (float)width  * 0.5f;
-        auto centreY   = (float)y + (float)height * 0.5f;
-        auto radius    = juce::jmin(width, height) * 0.5f - 5.0f;
-        auto angle     = rotaryStartAngle + sliderPosProportional * (rotaryEndAngle - rotaryStartAngle);
+        const auto area   = juce::Rectangle<float>((float)x, (float)y, (float)width, (float)height).reduced(2.0f);
+        const auto centre = area.getCentre();
+        const float radius = juce::jmin(area.getWidth(), area.getHeight()) * 0.5f - 2.0f;
+        if (radius < 8.0f) return;
 
-        if (radius <= 2.0f) return;
+        const bool enabled = slider.isEnabled();
+        const bool hot     = enabled && slider.isMouseOverOrDragging();
+        const auto accent  = slider.findColour(juce::Slider::rotarySliderFillColourId);
+        const float track  = juce::jlimit(3.0f, 6.5f, radius * 0.14f);
+        const float angle  = rotaryStartAngle + sliderPosProportional * (rotaryEndAngle - rotaryStartAngle);
+        const bool bipolar = (bool) slider.getProperties()["bipolar"];
+        const float from   = bipolar ? (rotaryStartAngle + rotaryEndAngle) * 0.5f : rotaryStartAngle;
+        const juce::PathStrokeType stroke(track, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
 
-        // --- Background arc track ---
-        {
-            juce::Path bg;
-            bg.addCentredArc(centreX, centreY, radius, radius, 0.0f,
-                             rotaryStartAngle, rotaryEndAngle, true);
-            g.setColour(borderCol());
-            g.strokePath(bg, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved,
-                                                   juce::PathStrokeType::rounded));
-        }
+        // Track
+        juce::Path arc;
+        arc.addCentredArc(centre.x, centre.y, radius, radius, 0.0f, rotaryStartAngle, rotaryEndAngle, true);
+        g.setColour(juce::Colour(0xff23233f));
+        g.strokePath(arc, stroke);
 
-        // --- Value arc (violet → cyan gradient) ---
+        // Value arc + glow
+        if (std::abs(angle - from) > 0.01f)
         {
             juce::Path val;
-            val.addCentredArc(centreX, centreY, radius, radius, 0.0f,
-                              rotaryStartAngle, angle, true);
-            juce::ColourGradient grad(accentViolet(), centreX - radius, centreY,
-                                      accentCyan(),   centreX + radius, centreY, false);
-            g.setGradientFill(grad);
-            g.strokePath(val, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved,
-                                                    juce::PathStrokeType::rounded));
+            val.addCentredArc(centre.x, centre.y, radius, radius, 0.0f,
+                              juce::jmin(from, angle), juce::jmax(from, angle), true);
+            g.setColour(accent.withAlpha(hot ? 0.30f : 0.16f));
+            g.strokePath(val, juce::PathStrokeType(track * 2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour(hot ? accent.brighter(0.25f) : accent);
+            g.strokePath(val, stroke);
         }
 
-        // --- Inner circle ---
-        auto innerR = radius * 0.58f;
-        g.setColour(panelBg());
-        g.fillEllipse(centreX - innerR, centreY - innerR, innerR * 2.0f, innerR * 2.0f);
-        g.setColour(borderCol());
-        g.drawEllipse(centreX - innerR, centreY - innerR, innerR * 2.0f, innerR * 2.0f, 1.0f);
+        // Body: shadow, top-lit gradient, rim
+        const float bodyR = radius - track * 1.8f;
+        const auto body = juce::Rectangle<float>(bodyR * 2.0f, bodyR * 2.0f).withCentre(centre);
+        g.setColour(juce::Colours::black.withAlpha(0.40f));
+        g.fillEllipse(body.translated(0.0f, 2.0f).expanded(1.0f));
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff2e2e56), centre.x, body.getY(),
+                                               juce::Colour(0xff15152b), centre.x, body.getBottom(), false));
+        g.fillEllipse(body);
+        g.setColour(hot ? accent.withAlpha(0.75f) : juce::Colour(0xff3a3a64));
+        g.drawEllipse(body.reduced(0.5f), 1.0f);
 
-        // --- Indicator line + tip dot ---
-        {
-            auto tipR  = radius * 0.76f;
-            auto baseR = innerR * 0.32f;
-            juce::Point<float> tip (centreX + std::sin(angle) * tipR,
-                                    centreY - std::cos(angle) * tipR);
-            juce::Point<float> base(centreX + std::sin(angle) * baseR,
-                                    centreY - std::cos(angle) * baseR);
+        // Pointer
+        const juce::Point<float> dir(std::sin(angle), -std::cos(angle));
+        juce::Path pointer;
+        pointer.startNewSubPath(centre + dir * (bodyR * 0.25f));
+        pointer.lineTo(centre + dir * (bodyR * 0.80f));
+        g.setColour(enabled ? textPrimary() : textSecondary());
+        g.strokePath(pointer, juce::PathStrokeType(juce::jlimit(2.0f, 3.5f, bodyR * 0.11f),
+                                                   juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
 
-            g.setColour(textPrimary().withAlpha(0.85f));
-            g.drawLine(base.x, base.y, tip.x, tip.y, 1.8f);
-
-            g.setColour(accentCyan());
-            g.fillEllipse(tip.x - 2.5f, tip.y - 2.5f, 5.0f, 5.0f);
-        }
+    juce::Label* createSliderTextBox(juce::Slider& slider) override
+    {
+        auto* l = juce::LookAndFeel_V4::createSliderTextBox(slider);
+        l->setFont(juce::FontOptions(12.0f));
+        l->setColour(juce::Label::textColourId, LatentPalette::textPrimary().withAlpha(0.85f));
+        l->setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
+        l->setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
+        return l;
     }
 
     //==========================================================================
@@ -178,9 +190,24 @@ public:
         g.setColour(border);
         g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, 1.0f);
 
+        // Status light on the left
+        auto textArea = button.getLocalBounds();
+        if (bounds.getWidth() > 60.0f)
+        {
+            const auto led = juce::Rectangle<float>(7.0f, 7.0f).withCentre({ bounds.getX() + 13.0f, bounds.getCentreY() });
+            if (isOn)
+            {
+                g.setColour(accentCyan().withAlpha(0.30f));
+                g.fillEllipse(led.expanded(3.0f));
+            }
+            g.setColour(isOn ? accentCyan() : juce::Colour(0xff2c2c4c));
+            g.fillEllipse(led);
+            textArea.removeFromLeft(14);
+        }
+
         g.setColour(isOn ? textPrimary() : textSecondary());
         g.setFont(juce::FontOptions(12.5f));
-        g.drawFittedText(button.getButtonText(), button.getLocalBounds(),
+        g.drawFittedText(button.getButtonText(), textArea,
                          juce::Justification::centred, 1);
     }
 

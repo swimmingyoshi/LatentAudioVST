@@ -32,6 +32,7 @@ public:
     void setMap (std::shared_ptr<const SoundMapData> newMap);
     void setCursorPosition (float x, float y);
     void setSnapping (bool shouldSnap) { isSnapping = shouldSnap; }
+    void setBlend (float newBlend);
     void resetView();
 
     // Text drawn over the map (loading / errors / empty state). Empty = none.
@@ -66,8 +67,10 @@ private:
     bool layerDirty = true;
 
     float cursorX = 0.0f, cursorY = 0.0f;
-    std::vector<int> neighbours;          // nearest points to the cursor (the blend)
-    std::vector<float> neighbourWeights;  // their IDW weights, summing to 1
+    std::vector<int> neighbours;          // sounds in the blend at the cursor, largest share first
+    std::vector<float> neighbourWeights;  // their shares of the blend
+    float effectiveCount = 0.0f;          // how many sounds effectively take part
+    float blend = 0.0f;
     int hoverIndex = -1;
 
     bool isSnapping = false;

@@ -37,6 +37,34 @@ public:
         expectWithinAbsoluteError (z[0], z[1], 1.0e-5f);
         expect (z[2] > 0.0f && z[2] < z[0]);
 
+        beginTest ("blend 0 is the map's own interpolation");
+        expect (map->interpolateBlend (0.2f, -0.4f, 0.0f) == map->interpolate (0.2f, -0.4f));
+        expect (map->interpolateBlend (-1.0f, -1.0f, 0.0f) == map->points[0].latent);
+
+        beginTest ("blend > 0 mixes other sounds in, even on a point, more as it grows");
+        {
+            const auto lo = map->interpolateBlend (-1.0f, -1.0f, 0.2f);
+            const auto hi = map->interpolateBlend (-1.0f, -1.0f, 1.0f);
+            expect (lo[1] > 0.0f && lo[2] > 0.0f);
+            expect (hi[1] > lo[1] && hi[2] > lo[2]);
+            expect (lo[0] > lo[1]); // the point under the cursor still leads
+            for (float v : hi)
+                expect (std::isfinite (v));
+        }
+
+        beginTest ("blend info: shares sum to one, largest first, count grows with blend");
+        {
+            const auto narrow = map->blendInfo (-0.9f, -0.9f, 0.0f, 10);
+            const auto wide = map->blendInfo (-0.9f, -0.9f, 1.0f, 10);
+            float sum = 0.0f;
+            for (auto& [i, s] : wide.top)
+                sum += s;
+            expectWithinAbsoluteError (sum, 1.0f, 1.0e-4f);
+            expectEquals (narrow.top.front().first, 0);
+            expect (wide.top.front().second >= wide.top.back().second);
+            expect (wide.effectiveCount > narrow.effectiveCount);
+        }
+
         beginTest ("nearest point ordering");
         auto idx = map->nearestIndices (0.9f, -0.9f, 3);
         expectEquals ((int) idx.size(), 3);

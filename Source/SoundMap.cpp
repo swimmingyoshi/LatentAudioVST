@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <functional>
 
 //==============================================================================
 std::vector<int> SoundMapData::nearestIndices (float x, float y, int kNearest) const
@@ -223,6 +224,125 @@ std::vector<float> SoundMapData::interpolate (float x, float y, int kNearest) co
 }
 
 //==============================================================================
+namespace
+{
+    // Unnormalised weight of every sound at (x, y). blend <= 0 mirrors the weighting
+    // the map's field was built with (mapfield.py, "shepard": a tapered 1/d^2, so it
+    // passes through each sound); older maps use 1/d^2 over the 5 nearest.
+    std::vector<float> blendWeights (const SoundMapData& m, float x, float y, float blend)
+    {
+        const size_t n = m.points.size();
+        std::vector<float> d2 (n);
+        float minD2 = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < n; ++i)
+        {
+            d2[i] = juce::square (x - m.points[i].x) + juce::square (y - m.points[i].y);
+            minD2 = std::min (minD2, d2[i]);
+        }
+
+        std::vector<float> w (n, 0.0f);
+        const float h = m.spacing;
+        if (blend > 0.0f)
+        {
+            const float b = juce::jlimit (0.0f, 1.0f, blend);
+            const float sigma = h * (0.6f + 3.4f * b * b); // gentle at first, wide at the top
+            const float inv = 1.0f / (2.0f * sigma * sigma);
+            for (size_t i = 0; i < n; ++i)
+                w[i] = std::exp (-(d2[i] - minD2) * inv);
+        }
+        else if (m.hasField())
+        {
+            const float eps2 = juce::square (0.15f * h), invH = 1.0f / (2.0f * juce::square (4.0f * h));
+            const float ref = -minD2 * invH - std::log (minD2 + eps2);
+            for (size_t i = 0; i < n; ++i)
+                w[i] = std::exp (-d2[i] * invH - std::log (d2[i] + eps2) - ref);
+        }
+        else
+        {
+            for (int idx : m.nearestIndices (x, y, 5))
+                w[(size_t) idx] = 1.0f / std::max (1.0e-10f, d2[(size_t) idx]);
+        }
+        return w;
+    }
+}
+
+std::vector<float> SoundMapData::interpolateBlend (float x, float y, float blend) const
+{
+    if (blend <= 0.0f || points.empty())
+        return interpolate (x, y);
+
+    const auto w = blendWeights (*this, x, y, blend);
+    std::vector<float> result ((size_t) latentDim, 0.0f);
+    float total = 0.0f, targetNorm = 0.0f;
+    for (size_t i = 0; i < points.size(); ++i)
+    {
+        if (w[i] < 1.0e-7f)
+            continue;
+        const auto& z = points[i].latent;
+        float norm = 0.0f;
+        for (int d = 0; d < latentDim; ++d)
+        {
+            result[(size_t) d] += w[i] * z[(size_t) d];
+            if (d != pitchIndex)
+                norm += z[(size_t) d] * z[(size_t) d];
+        }
+        targetNorm += w[i] * std::sqrt (norm);
+        total += w[i];
+    }
+    if (total <= 0.0f)
+        return interpolate (x, y);
+
+    float norm = 0.0f;
+    for (int d = 0; d < latentDim; ++d)
+    {
+        result[(size_t) d] /= total;
+        if (d != pitchIndex)
+            norm += result[(size_t) d] * result[(size_t) d];
+    }
+    // Keep the mix as "present" as the sounds it came from (pitch is left alone).
+    norm = std::sqrt (norm);
+    if (norm > 1.0e-6f)
+    {
+        const float gain = juce::jlimit (1.0f, 2.0f, (targetNorm / total) / norm);
+        for (int d = 0; d < latentDim; ++d)
+            if (d != pitchIndex)
+                result[(size_t) d] *= gain;
+    }
+    return result;
+}
+
+SoundMapData::BlendInfo SoundMapData::blendInfo (float x, float y, float blend, int maxCount) const
+{
+    BlendInfo info;
+    if (points.empty())
+        return info;
+
+    const auto w = blendWeights (*this, x, y, blend);
+    float total = 0.0f;
+    for (float v : w)
+        total += v;
+    if (total <= 0.0f)
+        return info;
+
+    float sumSq = 0.0f;
+    std::vector<std::pair<float, int>> order;
+    order.reserve (w.size());
+    for (size_t i = 0; i < w.size(); ++i)
+    {
+        const float s = w[i] / total;
+        sumSq += s * s;
+        if (s > 1.0e-4f)
+            order.emplace_back (s, (int) i);
+    }
+    const int k = std::min (maxCount, (int) order.size());
+    std::partial_sort (order.begin(), order.begin() + k, order.end(), std::greater<>());
+    for (int i = 0; i < k; ++i)
+        info.top.emplace_back (order[(size_t) i].second, order[(size_t) i].first);
+    info.effectiveCount = sumSq > 0.0f ? 1.0f / sumSq : 0.0f;
+    return info;
+}
+
+//==============================================================================
 std::shared_ptr<const SoundMapData> SoundMapData::parse (const juce::String& json, juce::String& error)
 {
     juce::var root;
@@ -330,6 +450,32 @@ std::shared_ptr<const SoundMapData> SoundMapData::parse (const juce::String& jso
     }
     if (map->field.isValid() && map->field.dim != map->latentDim)
         map->field = {};
+
+    // Spacing: median distance to the 5th nearest sound (as mapfield.py measures it).
+    {
+        const size_t n = map->points.size();
+        const size_t k = std::min<size_t> (5, n - 1);
+        std::vector<float> kth;
+        if (k > 0)
+        {
+            kth.reserve (n);
+            std::vector<float> d2 (n);
+            for (size_t i = 0; i < n; ++i)
+            {
+                for (size_t j = 0; j < n; ++j)
+                    d2[j] = i == j ? std::numeric_limits<float>::max()
+                                   : juce::square (map->points[i].x - map->points[j].x) + juce::square (map->points[i].y - map->points[j].y);
+                std::nth_element (d2.begin(), d2.begin() + (ptrdiff_t) (k - 1), d2.end());
+                kth.push_back (std::sqrt (d2[k - 1]));
+            }
+            std::nth_element (kth.begin(), kth.begin() + (ptrdiff_t) (kth.size() / 2), kth.end());
+            map->spacing = std::max (1.0e-3f, kth[kth.size() / 2]);
+        }
+        else
+        {
+            map->spacing = 0.5f;
+        }
+    }
 
     // A single point (or a degenerate axis) still needs a usable viewport.
     if (map->maxX - map->minX < 1.0e-6f) { map->minX -= 1.0f; map->maxX += 1.0f; }
