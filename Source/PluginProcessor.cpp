@@ -21,6 +21,37 @@
 
 namespace
 {
+    constexpr float kLowCutOff = 20.5f;      // Low Cut at (or below) this is bypassed
+    constexpr float kSubsonicHz = 18.0f;     // always removed from decodes (rumble + DC)
+
+    // Zero-phase 4th-order high-pass (2nd-order Butterworth run forward and back),
+    // so transients keep their shape. Offline, on a whole buffer.
+    void highPassZeroPhase (std::vector<float>& x, double sampleRate, double cutoff)
+    {
+        const double w = juce::MathConstants<double>::twoPi * cutoff / sampleRate;
+        // RBJ high-pass, Q = 1/sqrt(2): alpha = sin(w) / (2Q)
+        const double cs = std::cos (w), alpha = std::sin (w) / juce::MathConstants<double>::sqrt2;
+        const double a0 = 1.0 + alpha;
+        const double b0 = (1.0 + cs) * 0.5 / a0, b1 = -(1.0 + cs) / a0, b2 = b0;
+        const double a1 = -2.0 * cs / a0, a2 = (1.0 - alpha) / a0;
+        auto pass = [&] (auto begin, auto end)
+        {
+            double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+            for (auto it = begin; it != end; ++it)
+            {
+                const double in = *it;
+                const double out = b0 * in + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                x2 = x1; x1 = in; y2 = y1; y1 = out;
+                *it = (float) out;
+            }
+        };
+        pass (x.begin(), x.end());
+        pass (x.rbegin(), x.rend());
+    }
+
+    // Parameters that change which sound is decoded (besides the position).
+    const char* const kSoundParamIds[] = { "blend", "blendMode", "morph", "morphX", "morphY" };
+
     constexpr double kAttackSeconds     = 0.001;  // fixed declick gate
     constexpr double kReleaseSeconds    = 0.02;
     constexpr double kSwapFadeSeconds   = 0.05;   // crossfade when new audio replaces old
@@ -114,6 +145,18 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "blend", 4 }, "Blend", Range (0.0f, 1.0f), 0.0f,
         floatAttr (formatPercent)));
 
+    // Version 5: blend mode. Area = the neighbourhood blend above; Morph = cursor (A) -> B.
+    p.push_back (std::make_unique<juce::AudioParameterChoice> (PID { "blendMode", 5 }, "Blend Mode",
+        juce::StringArray { "Area", "A/B Morph" }, 0));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "morph", 5 }, "Morph A-B", Range (0.0f, 1.0f), 0.5f,
+        floatAttr (formatPercent)));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "morphX", 5 }, "Morph B X", Range (0.0f, 1.0f), 0.5f,
+        floatAttr ([] (float v) { return juce::String (v, 3); })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "lowCut", 5 }, "Low Cut (Hz)", Range (20.0f, 1000.0f, 1.0f, 0.35f), 20.0f,
+        floatAttr ([] (float v) { return v <= kLowCutOff ? juce::String ("Off") : formatHz (v); })));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (PID { "morphY", 5 }, "Morph B Y", Range (0.0f, 1.0f), 0.5f,
+        floatAttr ([] (float v) { return juce::String (v, 3); })));
+
     parameters = std::make_unique<juce::AudioProcessorValueTreeState> (
         *this, nullptr, "PARAMETERS", juce::AudioProcessorValueTreeState::ParameterLayout (p.begin(), p.end()));
 
@@ -125,10 +168,14 @@ LatentAudioVSTAudioProcessor::LatentAudioVSTAudioProcessor()
     pLatch = raw ("latchMode");       pTriggerOnMidi = raw ("triggerOnMidi");
     pKeyTrack = raw ("keyTrack");     pRootNote = raw ("rootNote");   pVelocity = raw ("velocitySens");
     pPolyphony = raw ("polyphony");     pBlend = raw ("blend");
+    pBlendMode = raw ("blendMode");    pMorph = raw ("morph");
+    pMorphX = raw ("morphX");          pMorphY = raw ("morphY");
+    pLowCut = raw ("lowCut");
 
     parameters->addParameterListener ("positionX", this);
     parameters->addParameterListener ("positionY", this);
-    parameters->addParameterListener ("blend", this);
+    for (auto* id : kSoundParamIds)
+        parameters->addParameterListener (id, this);
 
     {
         const juce::ScopedLock sl (statusLock);
@@ -142,7 +189,8 @@ LatentAudioVSTAudioProcessor::~LatentAudioVSTAudioProcessor()
 {
     parameters->removeParameterListener ("positionX", this);
     parameters->removeParameterListener ("positionY", this);
-    parameters->removeParameterListener ("blend", this);
+    for (auto* id : kSoundParamIds)
+        parameters->removeParameterListener (id, this);
     inferenceThread.stopThread (4000);
     // Loading a model can't be interrupted; wait so the job never outlives us.
     loaderPool.removeAllJobs (true, 60000);
@@ -179,7 +227,7 @@ void LatentAudioVSTAudioProcessor::parameterChanged (const juce::String& id, flo
 {
     if (id == "positionX" || id == "positionY")
         applyPositionParameters();
-    else if (id == "blend")
+    else if (std::any_of (std::begin (kSoundParamIds), std::end (kSoundParamIds), [&] (const char* s) { return id == s; }))
         requestInference (false); // re-decode; the next note (and held notes) use the new mix
 }
 
@@ -263,6 +311,33 @@ void LatentAudioVSTAudioProcessor::releaseFromUI()
     // (like a drum pad). Hold loops until switched off; MIDI note-off still gates.
 }
 
+bool LatentAudioVSTAudioProcessor::isMorphMode() const
+{
+    return pBlendMode->load() >= 0.5f;
+}
+
+juce::Point<float> LatentAudioVSTAudioProcessor::getMorphTarget() const
+{
+    auto map = soundMap.snapshot();
+    return map != nullptr ? normalizedToMap (*map, pMorphX->load(), pMorphY->load()) : juce::Point<float>();
+}
+
+void LatentAudioVSTAudioProcessor::setMorphTargetFromUI (float mapX, float mapY)
+{
+    auto map = soundMap.snapshot();
+    if (map == nullptr)
+        return;
+    const auto n = mapToNormalized (*map, mapX, mapY);
+    for (auto [id, v] : { std::pair<const char*, float> { "morphX", n.x }, std::pair<const char*, float> { "morphY", n.y } })
+    {
+        auto* param = parameters->getParameter (id);
+        param->beginChangeGesture();
+        param->setValueNotifyingHost (v);
+        param->endChangeGesture();
+    }
+    requestInference (pTriggerOnMidi->load() < 0.5f); // free mode: hear the new hybrid
+}
+
 void LatentAudioVSTAudioProcessor::moveCursorFromUI (float mapX, float mapY)
 {
     setCursorAndSyncHost (mapX, mapY, true);
@@ -299,7 +374,7 @@ void LatentAudioVSTAudioProcessor::resetParametersToDefaults()
         if (ranged == nullptr)
             continue;
         const auto id = ranged->getParameterID();
-        if (id == "positionX" || id == "positionY")
+        if (id == "positionX" || id == "positionY" || id == "morphX" || id == "morphY")
             continue;
         ranged->beginChangeGesture();
         ranged->setValueNotifyingHost (ranged->getDefaultValue());
@@ -367,6 +442,20 @@ std::vector<float> LatentAudioVSTAudioProcessor::renderForExport() const
     }
     fa.setResonance (0.5412f);
     fb.setResonance (1.3066f + juce::jlimit (0.0f, 1.0f, pReso->load()) * 7.0f);
+    if (const float lowCut = pLowCut->load(); lowCut > kLowCutOff)
+    {
+        juce::dsp::StateVariableTPTFilter<float> ha, hb;
+        for (auto* f : { &ha, &hb })
+        {
+            f->prepare (spec);
+            f->setType (juce::dsp::StateVariableTPTFilterType::highpass);
+            f->setCutoffFrequency (juce::jlimit (20.0f, (float) (0.45 * sr), lowCut));
+        }
+        ha.setResonance (0.5412f);
+        hb.setResonance (1.3066f);
+        for (auto& s : out)
+            s = hb.processSample (0, ha.processSample (0, s));
+    }
     const float gain = pGain->load() * pMix->load();
     for (auto& s : out)
         s = fb.processSample (0, fa.processSample (0, s)) * gain;
@@ -457,7 +546,17 @@ bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, float wantMidi, s
     if (map == nullptr || map->points.empty())
         return false;
 
-    auto latent = map->interpolateBlend (x, y, pBlend->load());
+    std::vector<float> latent;
+    if (pBlendMode->load() >= 0.5f)
+    {
+        // A/B morph: the sound under the cursor (A) toward the sound at B.
+        const auto b = normalizedToMap (*map, pMorphX->load(), pMorphY->load());
+        latent = map->mixLatents (map->interpolate (x, y), map->interpolate (b.x, b.y), pMorph->load());
+    }
+    else
+    {
+        latent = map->interpolateBlend (x, y, pBlend->load());
+    }
     outMidi = std::numeric_limits<float>::quiet_NaN();
     if (map->hasPitch())
     {
@@ -469,7 +568,7 @@ bool LatentAudioVSTAudioProcessor::decodeAt (float x, float y, float wantMidi, s
     if (! decoder.decode (latent, audio))
         return false;
 
-    return postProcess (audio);
+    return postProcess (audio, (double) juce::jmax (8000, modelSampleRate.load()));
 }
 
 double LatentAudioVSTAudioProcessor::ratioFor (float bufferMidi, int note) const
@@ -481,7 +580,7 @@ double LatentAudioVSTAudioProcessor::ratioFor (float bufferMidi, int note) const
     return std::pow (2.0, ((double) note - from) / 12.0);
 }
 
-bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
+bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio, double sampleRate)
 {
     if (audio.empty())
         return false;
@@ -489,6 +588,10 @@ bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
     for (float s : audio)
         if (! std::isfinite (s))
             return false;
+
+    // Remove sub-bass rumble and DC offset: inaudible, but compressors/EQs (OTT,
+    // low shelves) pull them up into fuzz and clicks.
+    highPassZeroPhase (audio, sampleRate, kSubsonicHz);
 
     // Trim the inaudible tail with a short fade so loops/one-shots end cleanly.
     const float threshold = juce::Decibels::decibelsToGain (-60.0f);
@@ -513,10 +616,14 @@ bool LatentAudioVSTAudioProcessor::postProcess (std::vector<float>& audio)
         std::fill (audio.begin() + fadeEnd, audio.end(), 0.0f);
     }
 
-    // Always end at zero.
-    const int rampLen = std::min (32, n);
+    // Always end at zero, with a real fade: many sounds are still ringing at the end
+    // of the decode, and a sudden stop is a click (loud after compression).
+    const int rampLen = std::min (n / 8, (int) (0.03 * sampleRate));
     for (int i = 0; i < rampLen; ++i)
-        audio[(size_t) (n - rampLen + i)] *= 1.0f - (float) (i + 1) / (float) rampLen;
+    {
+        const float t = (float) (i + 1) / (float) rampLen;
+        audio[(size_t) (n - rampLen + i)] *= 0.5f + 0.5f * std::cos (juce::MathConstants<float>::pi * t);
+    }
 
     float peak = 0.0f;
     for (float s : audio)
@@ -852,6 +959,15 @@ void LatentAudioVSTAudioProcessor::prepareToPlay (double sampleRate, int samples
         f->setType (juce::dsp::StateVariableTPTFilterType::lowpass);
         f->reset();
     }
+    for (auto* f : { &lowCutA, &lowCutB })
+    {
+        f->prepare (spec);
+        f->setType (juce::dsp::StateVariableTPTFilterType::highpass);
+        f->reset();
+    }
+    lowCutA.setResonance (0.5412f);
+    lowCutB.setResonance (1.3066f);
+    lowCutActive = false;
 
     cutoffSmoothed.reset (sampleRate, 0.02);
     cutoffSmoothed.setCurrentAndTargetValue (juce::jlimit (20.0f, (float) (0.45 * sampleRate), pCutoff->load()));
@@ -948,6 +1064,27 @@ void LatentAudioVSTAudioProcessor::processBlock (juce::AudioBuffer<float>& buffe
     // 4-pole: Butterworth pair at zero resonance; resonance only on the second stage.
     filterA.setResonance (0.5412f);
     filterB.setResonance (1.3066f + reso * 7.0f);
+
+    // Low Cut: 4-pole Butterworth high-pass, bypassed at its minimum.
+    const float lowCut = pLowCut->load();
+    if (lowCut > kLowCutOff)
+    {
+        if (! lowCutActive)
+        {
+            lowCutA.reset();
+            lowCutB.reset();
+            lowCutActive = true;
+        }
+        const float f = juce::jlimit (20.0f, nyquistSafe, lowCut);
+        lowCutA.setCutoffFrequency (f);
+        lowCutB.setCutoffFrequency (f);
+        for (int i = 0; i < numSamples; ++i)
+            out[i] = lowCutB.processSample (0, lowCutA.processSample (0, out[i]));
+    }
+    else
+    {
+        lowCutActive = false;
+    }
 
     for (int i = 0; i < numSamples; ++i)
     {

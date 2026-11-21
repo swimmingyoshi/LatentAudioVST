@@ -25,7 +25,7 @@ namespace
     enum Section { morphSection, playbackSection, filterSection, outputSection, numSections };
     const juce::Colour sectionAccents[] = { accentAmber(), accentViolet(), accentCyan(), juce::Colour (0xfff06080) };
     const char* sectionNames[] = { "SOUND", "PLAYBACK", "FILTER", "OUTPUT" };
-    const int sectionUnits[] = { 2, 5, 3, 4 }; // relative widths
+    const int sectionUnits[] = { 2, 5, 4, 4 }; // relative widths
     const juce::Colour errorColour (0xfff06080);
 }
 
@@ -36,6 +36,7 @@ void FilterGraph::paint (juce::Graphics& g)
     const float w = bounds.getWidth(), h = bounds.getHeight();
     lastCutoff = cutoffParam.load();
     lastReso = resoParam.load();
+    lastLowCut = lowCutParam.load();
 
     g.setColour (darkBg());
     g.fillRoundedRectangle (bounds, 4.0f);
@@ -52,13 +53,20 @@ void FilterGraph::paint (juce::Graphics& g)
     // Same topology as the processor: Butterworth stage + resonant stage.
     const float qa = 0.5412f, qb = 1.3066f + juce::jlimit (0.0f, 1.0f, lastReso) * 7.0f;
     auto stage = [] (float r, float q) { return 1.0f / std::sqrt (juce::square (1.0f - r * r) + juce::square (r / q)); };
+    const bool lowCutOn = lastLowCut > 20.5f;
 
     juce::Path response;
     for (int i = 0; i <= (int) w; i += 2)
     {
         const float f = 20.0f * std::pow (1000.0f, (float) i / w);
         const float r = f / juce::jmax (20.0f, lastCutoff);
-        const float db = juce::Decibels::gainToDecibels (stage (r, qa) * stage (r, qb), -80.0f);
+        float mag = stage (r, qa) * stage (r, qb);
+        if (lowCutOn)
+        {
+            const float rh = f / lastLowCut; // high-pass = low-pass response mirrored, times r^2 per stage
+            mag *= rh * rh * stage (rh, 0.5412f) * rh * rh * stage (rh, 1.3066f);
+        }
+        const float db = juce::Decibels::gainToDecibels (mag, -80.0f);
         const float y = juce::jlimit (0.0f, h, dbToY (db));
         if (i == 0) response.startNewSubPath ((float) i, y);
         else        response.lineTo ((float) i, y);
@@ -92,7 +100,8 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     : AudioProcessorEditor (&p),
       processor (p),
       filterGraph (*p.getAPVTS().getRawParameterValue ("filterCutoff"),
-                   *p.getAPVTS().getRawParameterValue ("filterResonance"))
+                   *p.getAPVTS().getRawParameterValue ("filterResonance"),
+                   *p.getAPVTS().getRawParameterValue ("lowCut"))
 {
     setLookAndFeel (&laf);
 
@@ -149,6 +158,7 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     // --- Map + waveform ---
     nebula.onCursorChanged = [this] (float x, float y, bool isDrag) { processor.triggerFromUI (x, y, ! isDrag); };
     nebula.onMouseReleased = [this] { processor.releaseFromUI(); };
+    nebula.onMorphTargetChanged = [this] (float x, float y) { processor.setMorphTargetFromUI (x, y); };
     addAndMakeVisible (nebula);
     addAndMakeVisible (waveform);
     nebula.setComponentID ("nebula");
@@ -167,10 +177,31 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     };
 
     // --- Knobs ---  (drag up/right, Shift = fine, wheel, double-click = reset)
-    addKnob ("blend", "Blend",
-             "How many sounds are mixed into the one you hear. 0% = the map's own blend (about ten nearby sounds, "
-             "and exactly the sound when you are on a star). Turn it up to mix in more and more distant sounds "
-             "for new hybrids. The map shows which sounds are in the mix.", morphSection);
+    blendKnob = &addKnob ("blend", "Blend",
+             "Area mode: how many sounds around the cursor are mixed into the one you hear. 0% = the map's own blend "
+             "(about ten nearby sounds, exactly the sound when you are on a star). Turn it up to mix in more distant "
+             "sounds. The map shows which sounds are in the mix.", morphSection);
+    morphKnob = &addKnob ("morph", "Morph A-B",
+             "A/B mode: blends the sound under the cursor (A) into the sound at B. Shift-click (or Alt-click) "
+             "the map to place B anywhere - far-apart sounds make the most unusual hybrids.", morphSection);
+    morphKnob->sharesPrevCell = true;
+
+    // Blend mode switch (two segments)
+    for (auto* b : { &areaModeButton, &morphModeButton })
+    {
+        b->setColour (juce::TextButton::buttonOnColourId, accentAmber());
+        b->setColour (juce::TextButton::textColourOnId, textPrimary());
+        b->setClickingTogglesState (false);
+        addAndMakeVisible (b);
+    }
+    areaModeButton.setTooltip ("Area: mix the sounds around the cursor (Blend knob).");
+    morphModeButton.setTooltip ("A/B: morph the cursor's sound (A) into another sound (B). Shift-click the map to place B.");
+    areaModeButton.setConnectedEdges (juce::Button::ConnectedOnRight);
+    morphModeButton.setConnectedEdges (juce::Button::ConnectedOnLeft);
+    areaModeButton.onClick = [this] { setBlendMode (false); };
+    morphModeButton.onClick = [this] { setBlendMode (true); };
+    areaModeButton.setComponentID ("modeArea");
+    morphModeButton.setComponentID ("modeMorph");
 
     addKnob ("playbackRate", "Rate", "Playback speed (also changes pitch).", playbackSection);
     addKnob ("fineTune", "Tune", "Fine tune in cents.", playbackSection).slider.getProperties().set ("bipolar", true);
@@ -179,6 +210,9 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     addKnob ("polyphony", "Voices", "How many notes can play at once (1 = mono: a new note cuts the last).", playbackSection);
 
     addAndMakeVisible (filterGraph);
+    addKnob ("lowCut", "Low Cut",
+             "High-pass: removes rumble and boom below this frequency. Try 60-120 Hz before OTT or heavy EQ. "
+             "Off at the far left (sub-20 Hz rumble is always removed).", filterSection);
     addKnob ("filterCutoff", "Cutoff", "Low-pass cutoff frequency.", filterSection);
     addKnob ("filterResonance", "Reso", "Low-pass resonance.", filterSection);
 
@@ -226,6 +260,16 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
     knob->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
     knobs.push_back (std::move (knob));
     return *knobs.back();
+}
+
+void LatentAudioVSTAudioProcessorEditor::setBlendMode (bool morph)
+{
+    if (auto* param = processor.getAPVTS().getParameter ("blendMode"))
+    {
+        param->beginChangeGesture();
+        param->setValueNotifyingHost (morph ? 1.0f : 0.0f);
+        param->endChangeGesture();
+    }
 }
 
 void LatentAudioVSTAudioProcessorEditor::addToggle (juce::ToggleButton& button, const juce::String& paramId,
@@ -387,16 +431,27 @@ void LatentAudioVSTAudioProcessorEditor::resized()
     for (size_t i = 0; i < inner.size(); ++i)
         inner[i] = sectionAreas[i].reduced (6, 0).withTrimmedTop (26).withTrimmedBottom (6);
 
-    filterGraph.setBounds (inner[filterSection].removeFromLeft (inner[filterSection].getWidth() / 3).reduced (2, 14));
+    {
+        auto modeRow = inner[morphSection].removeFromTop (22).withSizeKeepingCentre (juce::jmin (inner[morphSection].getWidth(), 130), 22);
+        areaModeButton.setBounds (modeRow.removeFromLeft (modeRow.getWidth() / 2));
+        morphModeButton.setBounds (modeRow);
+    }
+
+    filterGraph.setBounds (inner[filterSection].removeFromLeft (inner[filterSection].getWidth() / 4).reduced (2, 14));
 
     // One cell per knob, then every knob gets the same size (the largest that fits all).
     std::array<int, numSections> counts {};
-    for (auto& k : knobs) ++counts[(size_t) k->section];
+    for (auto& k : knobs) if (! k->sharesPrevCell) ++counts[(size_t) k->section];
     std::array<int, numSections> placed {};
     std::vector<juce::Rectangle<int>> cells;
     int knobSize = 1000;
     for (auto& k : knobs)
     {
+        if (k->sharesPrevCell)
+        {
+            cells.push_back (cells.back());
+            continue;
+        }
         const auto s = (size_t) k->section;
         const int width = inner[s].getWidth() / juce::jmax (1, counts[s] - placed[s]);
         cells.push_back (inner[s].removeFromLeft (width));
@@ -453,6 +508,20 @@ void LatentAudioVSTAudioProcessorEditor::timerCallback()
 
     nebula.setSnapping (snapToggle.getToggleState());
     nebula.setBlend (processor.getAPVTS().getRawParameterValue ("blend")->load());
+
+    // Blend mode: switch state, which knob shows, and B on the map.
+    const bool morph = processor.isMorphMode();
+    areaModeButton.setToggleState (! morph, juce::dontSendNotification);
+    morphModeButton.setToggleState (morph, juce::dontSendNotification);
+    if (blendKnob != nullptr && morphKnob != nullptr && morphKnob->slider.isVisible() != morph)
+    {
+        blendKnob->slider.setVisible (! morph);
+        blendKnob->label.setVisible (! morph);
+        morphKnob->slider.setVisible (morph);
+        morphKnob->label.setVisible (morph);
+    }
+    nebula.setMorph (morph, processor.getMorphTarget(),
+                     processor.getAPVTS().getRawParameterValue ("morph")->load());
     const auto cursor = processor.getCursor();
     nebula.setCursorPosition (cursor.x, cursor.y);
 

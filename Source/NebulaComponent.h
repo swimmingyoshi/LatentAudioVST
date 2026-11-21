@@ -33,6 +33,8 @@ public:
     void setCursorPosition (float x, float y);
     void setSnapping (bool shouldSnap) { isSnapping = shouldSnap; }
     void setBlend (float newBlend);
+    // A/B morph mode: B's position (map coordinates) and the morph amount 0..1.
+    void setMorph (bool enabled, juce::Point<float> target, float amount);
     void resetView();
 
     // Text drawn over the map (loading / errors / empty state). Empty = none.
@@ -40,6 +42,7 @@ public:
 
     std::function<void (float, float, bool isDrag)> onCursorChanged;  // map coordinates
     std::function<void()> onMouseReleased;
+    std::function<void (float, float)> onMorphTargetChanged; // Shift/Alt-click in morph mode
 
     void paint (juce::Graphics&) override;
     void resized() override { layerDirty = true; }
@@ -56,6 +59,7 @@ public:
 
 private:
     void pickAt (juce::Point<float> screenPos, bool isDrag);
+    juce::Point<float> pickPoint (juce::Point<float> screenPos) const; // clamped (and snapped)
     void rebuildPointsLayer();
     static juce::Colour starColour (float brightness);
     static juce::String displayName (const SoundPoint& p, int index);
@@ -71,6 +75,9 @@ private:
     std::vector<float> neighbourWeights;  // their shares of the blend
     float effectiveCount = 0.0f;          // how many sounds effectively take part
     float blend = 0.0f;
+    bool morphMode = false, draggingB = false;
+    juce::Point<float> morphTarget;
+    float morphAmount = 0.5f;
     int hoverIndex = -1;
 
     bool isSnapping = false;

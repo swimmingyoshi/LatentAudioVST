@@ -103,6 +103,10 @@ struct SoundMapData
     };
     BlendInfo blendInfo (float x, float y, float blend, int maxCount) const;
 
+    // A/B morph: a -> b by t (0..1). The timbre part keeps the size of the two
+    // sounds (a straight average of far-apart sounds would come out dull).
+    std::vector<float> mixLatents (const std::vector<float>& a, const std::vector<float>& b, float t) const;
+
     // Indices of the kNearest points, closest first.
     std::vector<int> nearestIndices (float x, float y, int kNearest) const;
 

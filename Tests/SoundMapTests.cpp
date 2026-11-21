@@ -65,6 +65,19 @@ public:
             expect (wide.effectiveCount > narrow.effectiveCount);
         }
 
+        beginTest ("A/B morph: ends are the two sounds, the middle keeps their size");
+        {
+            const auto& a = map->points[0].latent;
+            const auto& b = map->points[1].latent;
+            expect (map->mixLatents (a, b, 0.0f) == a);
+            const auto end = map->mixLatents (a, b, 1.0f);
+            for (size_t d = 0; d < a.size(); ++d)
+                expectWithinAbsoluteError (end[d], b[d], 1.0e-5f);
+            const auto mid = map->mixLatents (a, b, 0.5f);
+            auto norm = [] (const std::vector<float>& v) { float s = 0; for (float x : v) s += x * x; return std::sqrt (s); };
+            expect (norm (mid) >= 0.99f * juce::jmin (norm (a), norm (b)), "a halfway morph is not shrunk");
+        }
+
         beginTest ("nearest point ordering");
         auto idx = map->nearestIndices (0.9f, -0.9f, 3);
         expectEquals ((int) idx.size(), 3);

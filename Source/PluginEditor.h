@@ -28,15 +28,20 @@
 class FilterGraph : public juce::Component
 {
 public:
-    FilterGraph (std::atomic<float>& cutoff, std::atomic<float>& resonance) : cutoffParam (cutoff), resoParam (resonance) {}
+    FilterGraph (std::atomic<float>& cutoff, std::atomic<float>& resonance, std::atomic<float>& lowCut)
+        : cutoffParam (cutoff), resoParam (resonance), lowCutParam (lowCut) {}
 
-    bool needsUpdate() const { return cutoffParam.load() != lastCutoff || resoParam.load() != lastReso; }
+    bool needsUpdate() const
+    {
+        return cutoffParam.load() != lastCutoff || resoParam.load() != lastReso || lowCutParam.load() != lastLowCut;
+    }
     void paint (juce::Graphics&) override;
 
 private:
     std::atomic<float>& cutoffParam;
     std::atomic<float>& resoParam;
-    float lastCutoff = -1.0f, lastReso = -1.0f;
+    std::atomic<float>& lowCutParam;
+    float lastCutoff = -1.0f, lastReso = -1.0f, lastLowCut = -1.0f;
 };
 
 //==============================================================================
@@ -114,6 +119,7 @@ private:
         juce::Label label;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
         int section = 0;
+        bool sharesPrevCell = false; // drawn in the previous knob's place (mode-dependent knobs)
     };
 
     Knob& addKnob (const juce::String& paramId, const juce::String& name, const juce::String& tooltip, int section);
@@ -135,6 +141,10 @@ private:
     juce::TextButton loadButton { "Load Model..." }, unloadButton { "Unload" };
     juce::TextButton randomButton { "Random" }, centerButton { "Center" }, resetButton { "Reset" };
     juce::ToggleButton playOnNoteToggle, holdToggle, snapToggle, keyTrackToggle;
+    juce::TextButton areaModeButton { "Area" }, morphModeButton { "A / B" };
+    Knob* blendKnob = nullptr;
+    Knob* morphKnob = nullptr;
+    void setBlendMode (bool morph);
 
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
     std::vector<std::unique_ptr<Knob>> knobs;

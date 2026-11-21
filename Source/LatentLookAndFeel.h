@@ -163,6 +163,12 @@ public:
         juce::Colour border = borderCol();
 
         if (isDown)             { fill = accentViolet().withAlpha(0.45f); border = accentViolet(); }
+        else if (button.getToggleState())
+        {
+            // Selected segment of a mode switch: tinted with the button's "on" colour.
+            const auto on = button.findColour(juce::TextButton::buttonOnColourId);
+            fill = on.withAlpha(0.30f); border = on;
+        }
         else if (isHighlighted) { border = accentViolet().withAlpha(0.7f); }
 
         g.setColour(fill);

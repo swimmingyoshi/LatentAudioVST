@@ -311,6 +311,35 @@ std::vector<float> SoundMapData::interpolateBlend (float x, float y, float blend
     return result;
 }
 
+std::vector<float> SoundMapData::mixLatents (const std::vector<float>& a, const std::vector<float>& b, float t) const
+{
+    if (a.size() != b.size())
+        return a;
+    t = juce::jlimit (0.0f, 1.0f, t);
+    std::vector<float> r (a.size());
+    float na = 0.0f, nb = 0.0f, nr = 0.0f;
+    for (size_t d = 0; d < a.size(); ++d)
+    {
+        r[d] = a[d] + (b[d] - a[d]) * t;
+        if ((int) d != pitchIndex)
+        {
+            na += a[d] * a[d];
+            nb += b[d] * b[d];
+            nr += r[d] * r[d];
+        }
+    }
+    nr = std::sqrt (nr);
+    if (nr > 1.0e-6f)
+    {
+        const float target = std::sqrt (na) + (std::sqrt (nb) - std::sqrt (na)) * t;
+        const float gain = juce::jlimit (1.0f, 2.0f, target / nr);
+        for (size_t d = 0; d < r.size(); ++d)
+            if ((int) d != pitchIndex)
+                r[d] *= gain;
+    }
+    return r;
+}
+
 SoundMapData::BlendInfo SoundMapData::blendInfo (float x, float y, float blend, int maxCount) const
 {
     BlendInfo info;

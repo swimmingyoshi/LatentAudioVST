@@ -366,6 +366,44 @@ public:
             expect (allFinite (dark));
         }
 
+        beginTest ("decode clean-up: no DC or rumble, music band kept, smooth end");
+        {
+            auto tone = [] (double f, float dc)
+            {
+                std::vector<float> x (88200);
+                for (size_t i = 0; i < x.size(); ++i)
+                    x[i] = dc + 0.5f * (float) std::sin (juce::MathConstants<double>::twoPi * f * (double) i / 44100.0);
+                return x;
+            };
+            auto mean = [] (const std::vector<float>& x, int a, int b) { double s = 0; for (int i = a; i < b; ++i) s += x[(size_t) i]; return (float) (s / (b - a)); };
+
+            auto music = tone (100.0, 0.2f);   // 100 Hz with a DC offset
+            expect (LatentAudioVSTAudioProcessor::postProcess (music, 44100.0));
+            expectLessThan (std::abs (mean (music, 22050, 66150)), 0.002f);                // DC gone
+            expectWithinAbsoluteError (rms (music, 22050, 66150), 0.3536f, 0.01f);           // 100 Hz kept
+
+            auto rumble = tone (8.0, 0.0f);
+            LatentAudioVSTAudioProcessor::postProcess (rumble, 44100.0);
+            expectLessThan (rms (rumble, 22050, 66150), 0.3536f * 0.25f);                     // 8 Hz cut > 12 dB
+
+            // A sound still ringing at the end of the decode fades out instead of stopping dead.
+            const int n = (int) music.size();
+            expectEquals (music.back(), 0.0f);
+            expectLessThan (maxStep (std::vector<float> (music.end() - 1400, music.end())), 0.03f);
+            expect (std::abs (music[(size_t) (n - 1400)]) > 0.0f || std::abs (music[(size_t) (n - 1401)]) > 0.0f);
+        }
+
+        beginTest ("Low Cut: off by default, removes lows when turned up (also in exports)");
+        {
+            Rig r;
+            r.proc.injectDecodedAudio (sine (50.0, 44100.0, 44100));
+            const float off = rms (r.proc.renderForExport(), 4000, 40000);
+            r.set ("lowCut", 200.0f);
+            const float on = rms (r.proc.renderForExport(), 4000, 40000);
+            expect (on < off * 0.05f, "50 Hz is cut by a 200 Hz Low Cut");
+            r.set ("lowCut", 20.0f);
+        }
+
         beginTest ("filter: stable at full resonance, correct response at zero");
         {
             Rig r;
@@ -532,7 +570,8 @@ public:
         r.proc.copyDisplayWaveform (wave);
         std::vector<float> e0 (kTinyLatentDim, 0.0f);
         e0[0] = 1.0f;
-        const auto expected = tinyModelExpected (e0);
+        auto expected = tinyModelExpected (e0);
+        LatentAudioVSTAudioProcessor::postProcess (expected, 44100.0); // what every decode goes through
         expectEquals ((int) wave.size(), kTinySamples);
         if (wave.size() > 500)
             expectWithinAbsoluteError (wave[500], expected[500], 1.0e-5f);
@@ -603,6 +642,7 @@ public:
                     acc += z[(size_t) i] * 0.5 * std::sin (0.37 * i + 0.011 * j);
                 expected[(size_t) j] = (float) std::tanh (acc);
             }
+            LatentAudioVSTAudioProcessor::postProcess (expected, 44100.0);
             // The cursor's own decode may still land first; wait for the note's.
             p.render (256, { { 0, juce::MidiMessage::noteOn (1, 72, 1.0f) } });
             std::vector<float> wave;
@@ -999,12 +1039,29 @@ int renderSnapshots (const juce::File& modelDir, const juce::File& outDir)
 
     std::unique_ptr<juce::AudioProcessorEditor> editor (r.proc.createEditor());
     outDir.createDirectory();
-    for (auto size : { juce::Point<int> (980, 700), juce::Point<int> (760, 540), juce::Point<int> (1400, 900) })
+    for (auto size : { juce::Point<int> (1080, 720), juce::Point<int> (860, 580), juce::Point<int> (1400, 900) })
     {
         editor->setSize (size.x, size.y);
         pumpMessages (300); // let the editor's timer poll the processor
         auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
         auto file = outDir.getChildFile ("editor_" + juce::String (size.x) + "x" + juce::String (size.y) + ".png");
+        file.deleteFile();
+        juce::FileOutputStream stream (file);
+        juce::PNGImageFormat().writeImageToStream (image, stream);
+        std::cout << "wrote " << file.getFullPathName() << std::endl;
+    }
+
+    // A/B morph mode, B on a far-away sound.
+    if (auto map = r.proc.getMapSnapshot())
+    {
+        r.set ("blendMode", 1.0f);
+        r.set ("morph", 0.35f);
+        const auto& b = map->points[map->points.size() * 5 / 6];
+        r.proc.setMorphTargetFromUI (b.x, b.y);
+        editor->setSize (1080, 720);
+        pumpMessages (300);
+        auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
+        auto file = outDir.getChildFile ("editor_morph_1080x720.png");
         file.deleteFile();
         juce::FileOutputStream stream (file);
         juce::PNGImageFormat().writeImageToStream (image, stream);

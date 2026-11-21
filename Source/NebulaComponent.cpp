@@ -54,6 +54,16 @@ void NebulaComponent::setBlend (float newBlend)
     repaint();
 }
 
+void NebulaComponent::setMorph (bool enabled, juce::Point<float> target, float amount)
+{
+    if (enabled == morphMode && target == morphTarget && amount == morphAmount)
+        return;
+    morphMode = enabled;
+    morphTarget = target;
+    morphAmount = amount;
+    repaint();
+}
+
 void NebulaComponent::resetView()
 {
     zoom = 1.0f;
@@ -239,8 +249,53 @@ void NebulaComponent::paint (juce::Graphics& g)
     {
         const auto c = mapToScreen (cursorX, cursorY);
 
+        if (morphMode)
+        {
+            // A (cursor) -> B, with a marker at the morph amount.
+            const auto b = mapToScreen (morphTarget.x, morphTarget.y);
+            const auto bCol = accentCyan();
+            g.setGradientFill (juce::ColourGradient (accentAmber().withAlpha (0.8f), c.x, c.y, bCol.withAlpha (0.8f), b.x, b.y, false));
+            juce::Path line;
+            line.startNewSubPath (c);
+            line.lineTo (b);
+            juce::Path dashed;
+            const float dashes[] = { 5.0f, 4.0f };
+            juce::PathStrokeType (1.6f).createDashedStroke (dashed, line, dashes, 2);
+            g.fillPath (dashed);
+
+            const auto m = c + (b - c) * morphAmount;
+            g.setColour (juce::Colours::white);
+            g.fillEllipse (m.x - 4.0f, m.y - 4.0f, 8.0f, 8.0f);
+            g.setColour (accentAmber().interpolatedWith (bCol, morphAmount));
+            g.drawEllipse (m.x - 6.0f, m.y - 6.0f, 12.0f, 12.0f, 1.5f);
+
+            // B marker
+            {
+                juce::ColourGradient glow (bCol.withAlpha (0.35f), b.x, b.y, bCol.withAlpha (0.0f), b.x + 26.0f, b.y, true);
+                g.setGradientFill (glow);
+                g.fillEllipse (b.x - 26.0f, b.y - 26.0f, 52.0f, 52.0f);
+                g.setColour (bCol);
+                g.drawEllipse (b.x - 9.0f, b.y - 9.0f, 18.0f, 18.0f, 1.8f);
+                g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+                g.drawText ("B", juce::Rectangle<float> (b.x - 9.0f, b.y - 9.0f, 18.0f, 18.0f), juce::Justification::centred);
+            }
+
+            // What is playing, top-left.
+            const int ia = map->nearestIndex (cursorX, cursorY), ib = map->nearestIndex (morphTarget.x, morphTarget.y);
+            juce::String text;
+            text << "A: " << displayName (map->points[(size_t) ia], ia) << "   "
+                 << juce::roundToInt ((1.0f - morphAmount) * 100.0f) << " / " << juce::roundToInt (morphAmount * 100.0f)
+                 << "   B: " << displayName (map->points[(size_t) ib], ib);
+            g.setFont (juce::FontOptions (11.5f));
+            auto strip = bounds.reduced (8.0f, 6.0f).removeFromTop (18.0f);
+            strip.setWidth (juce::jmin (strip.getWidth(), juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), text) + 14.0f));
+            g.setColour (darkBg().withAlpha (0.65f));
+            g.fillRoundedRectangle (strip, 4.0f);
+            g.setColour (textPrimary().withAlpha (0.9f));
+            g.drawText (text, strip.reduced (7.0f, 0.0f), juce::Justification::centredLeft, true);
+        }
         // The sounds being mixed at the cursor: line/dot strength = share of the blend.
-        if (! neighbours.empty())
+        else if (! neighbours.empty())
         {
             const float top = juce::jmax (1.0e-6f, neighbourWeights.front());
             for (size_t i = neighbours.size(); i-- > 0;)
@@ -329,7 +384,8 @@ void NebulaComponent::paint (juce::Graphics& g)
         // Hint
         g.setFont (juce::FontOptions (10.5f));
         g.setColour (textSecondary().withAlpha (0.6f));
-        g.drawText ("click: play   right-drag: pan   wheel: zoom   double-click: reset",
+        g.drawText (morphMode ? "click: move A   shift-click: place B   right-drag: pan   wheel: zoom"
+                              : "click: play   right-drag: pan   wheel: zoom   double-click: reset",
                     bounds.reduced (8.0f, 4.0f), juce::Justification::bottomRight, false);
     }
 
@@ -355,6 +411,18 @@ void NebulaComponent::pickAt (juce::Point<float> screenPos, bool isDrag)
     if (map == nullptr || map->points.empty())
         return;
 
+    const auto pt = pickPoint (screenPos);
+    cursorX = pt.x;
+    cursorY = pt.y;
+    updateNeighbours();
+    repaint();
+
+    if (onCursorChanged)
+        onCursorChanged (cursorX, cursorY, isDrag);
+}
+
+juce::Point<float> NebulaComponent::pickPoint (juce::Point<float> screenPos) const
+{
     auto pt = screenToMap (screenPos.x, screenPos.y);
     pt.x = juce::jlimit (map->minX, map->maxX, pt.x);
     pt.y = juce::jlimit (map->minY, map->maxY, pt.y);
@@ -365,14 +433,7 @@ void NebulaComponent::pickAt (juce::Point<float> screenPos, bool isDrag)
         if (idx >= 0)
             pt = { map->points[(size_t) idx].x, map->points[(size_t) idx].y };
     }
-
-    cursorX = pt.x;
-    cursorY = pt.y;
-    updateNeighbours();
-    repaint();
-
-    if (onCursorChanged)
-        onCursorChanged (cursorX, cursorY, isDrag);
+    return pt;
 }
 
 void NebulaComponent::mouseDown (const juce::MouseEvent& e)
@@ -382,6 +443,18 @@ void NebulaComponent::mouseDown (const juce::MouseEvent& e)
         isPanning = true;
         panStartX = panX;
         panStartY = panY;
+        return;
+    }
+    draggingB = morphMode && (e.mods.isShiftDown() || e.mods.isAltDown());
+    if (draggingB)
+    {
+        if (map != nullptr && ! map->points.empty())
+        {
+            morphTarget = pickPoint (e.position);
+            repaint();
+            if (onMorphTargetChanged)
+                onMorphTargetChanged (morphTarget.x, morphTarget.y);
+        }
         return;
     }
     pickAt (e.position, false);
@@ -400,6 +473,17 @@ void NebulaComponent::mouseDrag (const juce::MouseEvent& e)
         repaint();
         return;
     }
+    if (draggingB)
+    {
+        if (map != nullptr && ! map->points.empty())
+        {
+            morphTarget = pickPoint (e.position);
+            repaint();
+            if (onMorphTargetChanged)
+                onMorphTargetChanged (morphTarget.x, morphTarget.y);
+        }
+        return;
+    }
     pickAt (e.position, true);
 }
 
@@ -410,6 +494,8 @@ void NebulaComponent::mouseUp (const juce::MouseEvent&)
         isPanning = false;
         return;
     }
+    if (std::exchange (draggingB, false))
+        return;
     if (onMouseReleased)
         onMouseReleased();
 }

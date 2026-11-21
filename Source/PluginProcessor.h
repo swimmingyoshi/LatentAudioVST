@@ -95,6 +95,11 @@ public:
     void triggerFromUI (float mapX, float mapY, bool restart = true);
     void releaseFromUI();                         // mouse up (ends the automation gesture)
     void moveCursorFromUI (float mapX, float mapY); // move without auditioning
+
+    // Blend mode "A/B Morph": the cursor is A, B is another spot on the map.
+    bool isMorphMode() const;
+    juce::Point<float> getMorphTarget() const;            // map coordinates
+    void setMorphTargetFromUI (float mapX, float mapY);
     void triggerRandomPosition();
     void resetParametersToDefaults();
 
@@ -119,6 +124,10 @@ public:
     // low-pass filter and Gain x Level applied (one-shot, full velocity). Mono, at
     // the model's sample rate. Empty if there is no sound.
     std::vector<float> renderForExport() const;
+
+    // Clean-up applied to every decode: rejects non-finite audio, removes sub-bass
+    // rumble/DC (zero-phase), trims the silent tail and fades the end to zero.
+    static bool postProcess (std::vector<float>& audio, double sampleRate = 44100.0);
     int getModelSampleRate() const { return modelSampleRate.load(); }
     bool isPitchedModel() const { return mapHasPitch.load(); }
     // Pitched models with Key Track: notes the model is asked to generate.
@@ -144,7 +153,6 @@ private:
     // Inference thread
     void serviceInference();
     bool decodeAt (float x, float y, float wantMidi, std::vector<float>& audio, float& outMidi) const;
-    static bool postProcess (std::vector<float>& audio);
     bool publishAudio (std::vector<float>&& audio, uint32_t generation, float midi, int note, uint32_t seq);
     bool decodeNoteIfNeeded (int note, bool refresh);
     double ratioFor (float bufferMidi, int note) const;
@@ -192,6 +200,11 @@ private:
     std::atomic<float>* pVelocity = nullptr;
     std::atomic<float>* pPolyphony = nullptr;
     std::atomic<float>* pBlend = nullptr;
+    std::atomic<float>* pBlendMode = nullptr;
+    std::atomic<float>* pMorph = nullptr;
+    std::atomic<float>* pMorphX = nullptr;
+    std::atomic<float>* pMorphY = nullptr;
+    std::atomic<float>* pLowCut = nullptr;
 
     //==========================================================================
     SoundMap soundMap;
@@ -303,6 +316,8 @@ private:
 
     double hostSampleRate = 44100.0;
     juce::dsp::StateVariableTPTFilter<float> filterA, filterB;
+    juce::dsp::StateVariableTPTFilter<float> lowCutA, lowCutB;
+    bool lowCutActive = false;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> cutoffSmoothed;
     juce::SmoothedValue<float> gainSmoothed;
     JUCE_DECLARE_WEAK_REFERENCEABLE (LatentAudioVSTAudioProcessor)
