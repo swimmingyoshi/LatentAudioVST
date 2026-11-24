@@ -24,6 +24,39 @@ LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interac
 
 [Watch the demo video on YouTube](https://www.youtube.com/watch?v=94xgIDpDgX0)
 
+## What's New in v2.0
+
+- **Sky map**: sounds are stars coloured by brightness, with a smooth field between them instead of jumps
+- **Blend** and **A/B morph**, with the mix shown on the map
+- **8-voice polyphony**, and *pitched* models that generate the real note with Key Track
+- **Drag to DAW / Save WAV**, rendered through the plugin's effects
+- **Low Cut** knob; sub-bass rumble, DC and end clicks removed
+- ONNX Runtime and the Visual C++ runtime files are included in the download
+- Audio engine reworked for real-time safety
+
+Older models and projects are still supported.
+
+### Why use the v2 models
+
+| | v1 | v2 |
+| :--- | :--- | :--- |
+| Decoder file | 1005 MB | **19 MB** |
+| Load time | 4.3 s | **0.2 s** |
+| Decode time (kicks, CPU) | 575 ms | **116 ms** |
+| Kicks: mel error, held-out sounds | 1.97 dB | **1.54 dB** |
+| Kicks: envelope error, held-out sounds | 1.81 dB | **1.01 dB** |
+| Synths: mel error, held-out sounds | 8.2 dB | **5.1 dB** |
+| Synths: loudness error, held-out sounds | 12.7 dB | **2.2 dB** |
+
+Lower is better. Measured with `scripts/compare_models.py` on the same sounds (held out from v2 training), matched in
+level; both use the same CPU runtime in Python. Decode inside the plugin was 280 ms (v1) and 57 ms (v2) for kicks.
+
+Pitched models also play in tune: the strings model was within half a semitone on 97% of 60 held-out notes
+(97-100% when transposed up to 7 semitones).
+
+Known limits: fine high-frequency texture (attacks, dense harmonics) is softer than in the recordings, and some
+models add low-end rumble (use Low Cut). See [LatentAudio](https://github.com/swimmingyoshi/LatentAudio) to train your own.
+
 ## How It Works
 
 LatentAudioVST uses machine learning models trained on audio samples to create a compressed "latent" representation of sound. Each point in a 2D coordinate system maps to a high-dimensional latent vector that, when decoded by an ONNX neural network model, produces audio.
@@ -60,7 +93,12 @@ A precompiled VST binary is available in the [GitHub Releases](https://github.co
 This binary includes third-party software listed in `THIRD_PARTY_LICENSES.md`.  
 Source code is always available in this repository.
 
-Model and soundmap json can be found in huggingface [repo](https://huggingface.co/Meowmeow42/LatentAudioVST/tree/main)
+**v2 model:** `StringsModel_v2p.zip` (violin, viola, cello, double bass; pitched) is attached to the
+[v2.0.0-beta release](https://github.com/swimmingyoshi/LatentAudioVST/releases/tag/v2.0.0-beta). Extract it and drag the folder
+onto the plugin. It was trained on [Philharmonia sound samples](https://philharmonia.co.uk/resources/sound-samples/), which must
+not be sold or made available "as is"; the project is not affiliated with the Philharmonia.
+
+The older v1 model is on [Hugging Face](https://huggingface.co/Meowmeow42/LatentAudioVST/tree/main).
 
 ### Installation
 1. Extract the release zip (everything needed, including ONNX Runtime, is in the bundle) or build the project yourself
