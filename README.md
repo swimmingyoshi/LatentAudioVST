@@ -24,6 +24,8 @@ LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interac
 
 [Watch the demo video on YouTube](https://www.youtube.com/watch?v=94xgIDpDgX0)
 
+![LatentAudioVST sky map with the strings model](images/sky-map.png)
+
 ## What's New in v2.0
 
 - **Sky map**: sounds are stars coloured by brightness, with a smooth field between them instead of jumps
@@ -35,6 +37,10 @@ LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interac
 - Audio engine reworked for real-time safety
 
 Older models and projects are still supported.
+
+A/B morph: the cursor's sound (A) blended into another sound (B):
+
+![A/B morph mode](images/ab-morph.png)
 
 ### Why use the v2 models
 
