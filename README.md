@@ -14,7 +14,7 @@ If Building yourself, you need to have the onnx folder in Libs (extract either b
 The `.jucer` expects the JUCE `modules` folder at `../../VST_Plugins/JUCE/modules` relative to this project folder. Change the module paths in Projucer if your JUCE lives elsewhere.
 
 The build copies `onnxruntime.dll` and `onnxruntime_providers_shared.dll` into the bundle automatically:
-`LatentAudioVST.vst3\Contents_64-win\` (next to the plugin binary).
+`LatentAudioVST.vst3\Contents\x86_64-win\` (next to the plugin binary).
 The runtime is delay-loaded by full path from that folder, so the plugin never picks up the unrelated
 `onnxruntime.dll` that Windows 11 ships in System32, and a missing runtime shows an error instead of crashing the host.
 
@@ -50,7 +50,7 @@ LatentAudioVST uses machine learning models trained on audio samples to create a
 ## Installation & Setup
 
 ### Prerequisites
-- DAW supporting VST3 plugins (Ableton Live, Logic Pro, FL Studio, etc.)
+- DAW supporting VST3 plugins (FL Studio, Ableton Live, Cubase, Reaper, etc.)
 - Windows 10/11 (currently Windows-only)
 
 
@@ -63,8 +63,8 @@ Source code is always available in this repository.
 Model and soundmap json can be found in huggingface [repo](https://huggingface.co/Meowmeow42/LatentAudioVST/tree/main)
 
 ### Installation
-1. Build the project using the provided Visual Studio solution
-2. Copy the resulting `.vst3` file to your VST3 directory:
+1. Extract the release zip (everything needed, including ONNX Runtime, is in the bundle) or build the project yourself
+2. Copy the whole `LatentAudioVST.vst3` **folder** to your VST3 directory:
    - Default: `C:\Program Files\Common Files\VST3\`
 3. Restart your DAW
 4. Scan for new plugins
@@ -106,7 +106,13 @@ Model and soundmap json can be found in huggingface [repo](https://huggingface.c
 - **Root**: with Key Track on, the MIDI note that plays at the original pitch
 - **Voices**: how many notes play at once (1-8; 1 = mono, a new note cuts the last one). With a pitched model and Key Track, each note of a chord is generated at its own pitch
 
+#### Sound
+- **Area / A/B** switch: what the blend section does
+- **Blend** (Area): how many sounds around the cursor are mixed; the map shows the mix. 0% = the map's own blend
+- **Morph A-B** (A/B): blends the cursor's sound (A) into the sound at B. Shift-click (or Alt-click) the map to place B
+
 #### Filter
+- **Low Cut**: 4-pole high-pass, off at its minimum
 - **Cutoff** / **Reso**: 4-pole low-pass with resonance, smoothed so automation doesn't zipper. The graph shows the real response in dB.
 
 #### Output
@@ -247,7 +253,14 @@ Check this file for detailed error information and troubleshooting data.
 ## Development
 
 ### Building
-See `AGENTS.md` for detailed build instructions using Projucer and Visual Studio.
+Save `LatentAudioVST.jucer` in Projucer (`Projucer.exe --resave LatentAudioVST.jucer`), then:
+
+```bat
+MSBuild.exe Builds\VisualStudio2022\LatentAudioVST.sln /p:Configuration=Release /p:Platform=x64
+```
+
+Release builds link the C++ runtime statically. `onnxruntime.dll` still needs the Visual C++ runtime; the release zip
+includes those DLLs next to the plugin.
 
 ### Tests
 `Tests/` builds a console test runner from the same sources with CMake:
@@ -259,7 +272,7 @@ Tests/build/LatentAudioTests_artefacts/Release/LatentAudioTests.exe
 ```
 
 Extra modes:
-- `LatentAudioTests.exe --host <path	o\LatentAudioVST.vst3> <modelFolder> [shot.png]` loads the built plugin like a DAW (VST3 hosting), restores a model through the plugin state, automates the position, opens the editor and checks the audio.
+- `LatentAudioTests.exe --host <path\to\LatentAudioVST.vst3> <modelFolder> [shot.png]` loads the built plugin like a DAW (VST3 hosting), restores a model through the plugin state, automates the position, opens the editor and checks the audio.
 - `LatentAudioTests.exe --snapshot <modelFolder> <outDir>` renders the editor to PNGs.
 
 The tests use a tiny deterministic model in `Tests/data/tiny_model` (regenerate with `Tests/tools/make_tiny_model.py`). Set `LATENTAUDIO_REAL_MODEL` to an exported model folder to also run an end-to-end test (with decode timing) on a real model.
