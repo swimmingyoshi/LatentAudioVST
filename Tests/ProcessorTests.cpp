@@ -932,6 +932,73 @@ public:
         expectWithinAbsoluteError (r.get ("playbackRate"), 1.0f, 1.0e-3f);
         expectWithinAbsoluteError (r.get ("outputGain"), 1.0f, 1.0e-3f);
 
+        beginTest ("right-click opens the host's menu and never changes a value");
+        {
+            struct Menu : juce::HostProvidedContextMenu
+            {
+                explicit Menu (int& n) : shown (n) {}
+                juce::PopupMenu getEquivalentPopupMenu() const override { return {}; }
+                void showNativeMenu (juce::Point<int>) const override { ++shown; }
+                int& shown;
+            };
+            struct Host : juce::AudioProcessorEditorHostContext
+            {
+                std::unique_ptr<juce::HostProvidedContextMenu> getContextMenuForParameter (const juce::AudioProcessorParameter* p) const override
+                {
+                    asked = dynamic_cast<const juce::RangedAudioParameter*> (p)->getParameterID();
+                    return std::make_unique<Menu> (shown);
+                }
+                mutable juce::String asked;
+                mutable int shown = 0;
+            } host;
+            struct Gestures : juce::AudioProcessorListener
+            {
+                void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override { ++count; }
+                void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override {}
+                void audioProcessorParameterChangeGestureBegin (juce::AudioProcessor*, int) override { ++count; }
+                int count = 0;
+            } gestures;
+
+            editor->setHostContext (&host);
+            r.proc.addListener (&gestures);
+            for (auto id : { "blend", "morph", "playbackRate", "fineTune", "crossfade", "rootNote", "polyphony", "lowCut",
+                             "filterCutoff", "filterResonance", "sampleStart", "sampleLength", "velocitySens", "outputGain",
+                             "triggerOnMidi", "latchMode", "snapMode", "keyTrack" })
+            {
+                auto* c = find<juce::Component> (*editor, id);
+                if (c == nullptr) continue;
+                const auto now = juce::Time::getCurrentTime();
+                const juce::Point<float> at (5.0f, 5.0f);
+                const juce::MouseEvent e (src, at, right, juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f,
+                                          c, c, now, at, now, 1, false);
+                const float before2 = r.get (id);
+                const int shown = host.shown;
+                c->mouseDown (e);
+                static_cast<juce::Component*> (editor)->mouseDown (e); // as the registered listener
+                c->mouseDrag (e);
+                c->mouseUp (e);
+                c->mouseDoubleClick (e);
+                pumpMessages (30);
+                expectEquals (host.asked, juce::String (id));
+                expectEquals (host.shown, shown + 1);
+                expectEquals (r.get (id), before2);
+            }
+            expectEquals (gestures.count, 0);
+            r.proc.removeListener (&gestures);
+            editor->setHostContext (nullptr);
+
+            // Map: a right click asks for the menu, a right drag (pan) does not.
+            int menus = 0;
+            auto original = std::exchange (nebula->onContextMenu, [&] { ++menus; });
+            nebula->mouseDown (event (mid, right, mid));
+            nebula->mouseUp (event (mid, right, mid));
+            expectEquals (menus, 1);
+            nebula->mouseDown (event (mid, right, mid));
+            nebula->mouseUp (event (mid, right, mid, 1, true));
+            expectEquals (menus, 1);
+            nebula->onContextMenu = original;
+        }
+
         beginTest ("Unload clears the model and the map view");
         click (find<juce::Button> (*editor, "unload"));
         expect (r.proc.getLoadStatus().state == LoadState::Empty);

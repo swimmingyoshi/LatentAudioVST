@@ -153,11 +153,13 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     midiLed.setTooltip ("MIDI activity");
     addAndMakeVisible (midiLed);
     coordLabel.setJustificationType (juce::Justification::centredRight);
-    coordLabel.setTooltip ("Cursor position (automatable as Position X / Position Y)");
+    coordLabel.setTooltip ("Cursor position. Right-click (here or on the map) to automate Position X / Position Y.");
+    addParameterMenu (coordLabel, { "positionX", "positionY" });
 
     // --- Map + waveform ---
     nebula.onCursorChanged = [this] (float x, float y, bool isDrag) { processor.triggerFromUI (x, y, ! isDrag); };
     nebula.onMouseReleased = [this] { processor.releaseFromUI(); };
+    nebula.onContextMenu = [this] { showMapMenu(); };
     nebula.onMorphTargetChanged = [this] (float x, float y) { processor.setMorphTargetFromUI (x, y); };
     addAndMakeVisible (nebula);
     addAndMakeVisible (waveform);
@@ -200,6 +202,8 @@ LatentAudioVSTAudioProcessorEditor::LatentAudioVSTAudioProcessorEditor (LatentAu
     morphModeButton.setConnectedEdges (juce::Button::ConnectedOnLeft);
     areaModeButton.onClick = [this] { setBlendMode (false); };
     morphModeButton.onClick = [this] { setBlendMode (true); };
+    for (auto* b : { &areaModeButton, &morphModeButton })
+        addParameterMenu (*b, { "blendMode" });
     areaModeButton.setComponentID ("modeArea");
     morphModeButton.setComponentID ("modeMorph");
 
@@ -240,7 +244,7 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
 {
     auto knob = std::make_unique<Knob>();
     knob->section = section;
-    knob->slider.setTooltip (tooltip + "\n(Drag up/right, Shift for fine, double-click to reset.)");
+    knob->slider.setTooltip (tooltip + "\n(Drag up/right, Shift for fine, double-click to reset, right-click to automate.)");
     knob->slider.setColour (juce::Slider::rotarySliderFillColourId, sectionAccents[section]);
     knob->slider.setComponentID (paramId);
     knob->slider.setPopupDisplayEnabled (false, false, nullptr);
@@ -258,6 +262,7 @@ LatentAudioVSTAudioProcessorEditor::Knob& LatentAudioVSTAudioProcessorEditor::ad
     addAndMakeVisible (knob->label);
     // After parenting, so the value box is created with our look-and-feel.
     knob->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
+    addParameterMenu (knob->slider, { paramId });
     knobs.push_back (std::move (knob));
     return *knobs.back();
 }
@@ -281,6 +286,109 @@ void LatentAudioVSTAudioProcessorEditor::addToggle (juce::ToggleButton& button, 
     buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), paramId, button));
     addAndMakeVisible (button);
+    addParameterMenu (button, { paramId });
+}
+
+//==============================================================================
+// Automation menus
+void LatentAudioVSTAudioProcessorEditor::addParameterMenu (juce::Component& component, const juce::StringArray& paramIds)
+{
+    parameterMenus.emplace_back (&component, paramIds);
+    component.addMouseListener (this, true); // children too (a knob's value box)
+}
+
+void LatentAudioVSTAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
+{
+    if (! e.mods.isPopupMenu())
+        return;
+
+    for (const auto& [component, ids] : parameterMenus)
+    {
+        if (e.originalComponent == component || component->isParentOf (e.originalComponent))
+        {
+            // Not from inside the mouse callback: host menus can run their own event loop.
+            juce::MessageManager::callAsync (
+                [safeThis = juce::Component::SafePointer<LatentAudioVSTAudioProcessorEditor> (this), ids = ids,
+                 pos = e.getEventRelativeTo (this).getPosition()]
+                {
+                    if (safeThis != nullptr)
+                        safeThis->showParameterMenu (ids, pos);
+                });
+            return;
+        }
+    }
+}
+
+void LatentAudioVSTAudioProcessorEditor::showMapMenu()
+{
+    juce::StringArray ids { "positionX", "positionY" };
+    if (processor.isMorphMode())
+        ids.addArray ({ "morphX", "morphY" });
+
+    juce::MessageManager::callAsync (
+        [safeThis = juce::Component::SafePointer<LatentAudioVSTAudioProcessorEditor> (this), ids, pos = getMouseXYRelative()]
+        {
+            if (safeThis != nullptr)
+                safeThis->showParameterMenu (ids, pos);
+        });
+}
+
+void LatentAudioVSTAudioProcessorEditor::showParameterMenu (const juce::StringArray& paramIds, juce::Point<int> editorPos)
+{
+    if (paramIds.size() == 1)
+    {
+        showHostMenu (paramIds[0], editorPos);
+        return;
+    }
+
+    // Several parameters share this spot: choose one first.
+    juce::PopupMenu menu;
+    menu.setLookAndFeel (&laf);
+    menu.addSectionHeader ("Automate");
+    for (const auto& id : paramIds)
+    {
+        if (auto* param = processor.getAPVTS().getParameter (id))
+        {
+            menu.addItem (param->getName (64),
+                [safeThis = juce::Component::SafePointer<LatentAudioVSTAudioProcessorEditor> (this), id, editorPos]
+                {
+                    if (safeThis != nullptr)
+                        safeThis->showHostMenu (id, editorPos);
+                });
+        }
+    }
+    menu.showMenuAsync (juce::PopupMenu::Options().withParentComponent (this)
+                            .withTargetScreenArea (juce::Rectangle<int> (1, 1).withPosition (localPointToGlobal (editorPos))));
+}
+
+void LatentAudioVSTAudioProcessorEditor::showHostMenu (const juce::String& paramId, juce::Point<int> editorPos)
+{
+    auto* param = processor.getAPVTS().getParameter (paramId);
+    if (param == nullptr)
+        return;
+
+    if (auto* host = getHostContext())
+    {
+        if (auto hostMenu = host->getContextMenuForParameter (param))
+        {
+            hostMenu->showNativeMenu (editorPos);
+            return;
+        }
+    }
+
+    // No host menu (standalone, or a host without VST3 context menus).
+    juce::PopupMenu menu;
+    menu.setLookAndFeel (&laf);
+    menu.addSectionHeader (param->getName (64));
+    menu.addItem ("This host has no automation menu: use its parameter list", false, false, nullptr);
+    menu.addItem ("Reset to default", [param]
+    {
+        param->beginChangeGesture();
+        param->setValueNotifyingHost (param->getDefaultValue());
+        param->endChangeGesture();
+    });
+    menu.showMenuAsync (juce::PopupMenu::Options().withParentComponent (this)
+                            .withTargetScreenArea (juce::Rectangle<int> (1, 1).withPosition (localPointToGlobal (editorPos))));
 }
 
 //==============================================================================

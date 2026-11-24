@@ -441,6 +441,7 @@ void NebulaComponent::mouseDown (const juce::MouseEvent& e)
     if (isPanGesture (e))
     {
         isPanning = true;
+        rightPress = e.mods.isRightButtonDown();
         panStartX = panX;
         panStartY = panY;
         return;
@@ -487,11 +488,13 @@ void NebulaComponent::mouseDrag (const juce::MouseEvent& e)
     pickAt (e.position, true);
 }
 
-void NebulaComponent::mouseUp (const juce::MouseEvent&)
+void NebulaComponent::mouseUp (const juce::MouseEvent& e)
 {
     if (isPanning)
     {
         isPanning = false;
+        if (rightPress && ! e.mouseWasDraggedSinceMouseDown() && onContextMenu)
+            onContextMenu();
         return;
     }
     if (std::exchange (draggingB, false))
@@ -530,8 +533,10 @@ void NebulaComponent::mouseExit (const juce::MouseEvent&)
     }
 }
 
-void NebulaComponent::mouseDoubleClick (const juce::MouseEvent&)
+void NebulaComponent::mouseDoubleClick (const juce::MouseEvent& e)
 {
+    if (e.mods.isRightButtonDown())
+        return;
     resetView();
 }
 

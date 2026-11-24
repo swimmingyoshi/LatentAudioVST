@@ -146,6 +146,14 @@ int hostPlugin (const juce::File& vst3, const juce::File& modelDir, const juce::
 
     auto* posX = findParam (*plugin, "Position X");
     auto* posY = findParam (*plugin, "Position Y");
+    bool positionOk = true;
+    for (auto* p : { posX, posY })
+    {
+        positionOk = positionOk && p != nullptr && p->isAutomatable();
+        if (p != nullptr)
+            std::cout << "host parameter list: #" << p->getParameterIndex() << " " << p->getName (64)
+                      << (p->isAutomatable() ? " (automatable)" : " (NOT automatable)") << std::endl;
+    }
     juce::AudioBuffer<float> buffer (juce::jmax (2, plugin->getTotalNumOutputChannels()), 512);
     juce::MidiBuffer midi;
     double sumSq = 0.0;
@@ -153,6 +161,7 @@ int hostPlugin (const juce::File& vst3, const juce::File& modelDir, const juce::
     bool finite = true;
     const auto start = juce::Time::getMillisecondCounter();
     bool auditioned = false;
+    int rightClicksInPlugin = 0;
 
     // ~12 s of "real time" audio with the message loop running.
     for (int block = 0; block < 1100; ++block)
@@ -164,6 +173,29 @@ int hostPlugin (const juce::File& vst3, const juce::File& modelDir, const juce::
             posY->setValueNotifyingHost (0.6f);
             auditioned = true;
         }
+       #if JUCE_WINDOWS
+        // Right-click every part of the knob rows through the real window, like a user.
+        if (window != nullptr && block >= 400 && block < 460)
+        {
+            auto top = static_cast<HWND> (window->getWindowHandle());
+            RECT rc;
+            GetClientRect (top, &rc);
+            POINT pt { (rc.right * (block - 400)) / 60, rc.bottom - 60 };
+            HWND target = top;
+            for (;;)
+            {
+                HWND child = ChildWindowFromPointEx (target, pt, CWP_SKIPINVISIBLE);
+                if (child == nullptr || child == target) break;
+                MapWindowPoints (target, child, &pt, 1);
+                target = child;
+            }
+            rightClicksInPlugin += target != top ? 1 : 0;
+            PostMessage (target, WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM (pt.x, pt.y));
+            PostMessage (target, WM_RBUTTONUP, 0, MAKELPARAM (pt.x, pt.y));
+        }
+        if (block == 470)
+            juce::PopupMenu::dismissAllActiveMenus();
+       #endif
         midi.clear();
         plugin->processBlock (buffer, midi);
         if (auditioned)
@@ -194,7 +226,8 @@ int hostPlugin (const juce::File& vst3, const juce::File& modelDir, const juce::
     plugin->releaseResources();
     plugin.reset();
 
-    const bool ok = finite && level > 1.0e-4;
+    std::cout << "survived " << rightClicksInPlugin << " right clicks in the editor" << std::endl;
+    const bool ok = finite && positionOk && level > 1.0e-4;
     std::cout << (ok ? "HOST TEST PASSED" : "HOST TEST FAILED") << std::endl;
     return ok ? 0 : 1;
 }

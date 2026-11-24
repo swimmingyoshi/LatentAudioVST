@@ -59,6 +59,9 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override
     {
+        rightClick = e.mods.isPopupMenu();
+        if (rightClick)
+            return; // the editor shows the automation menu; no gesture, no value change
         juce::Slider::mouseDown (e); // starts the host gesture
         lastDragPos = e.position;
         dragProportion = valueToProportionOfLength (getValue());
@@ -66,7 +69,7 @@ public:
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
-        if (! isEnabled() || e.mods.isPopupMenu())
+        if (! isEnabled() || rightClick)
             return;
         const float delta = (lastDragPos.y - e.position.y) + (e.position.x - lastDragPos.x);
         lastDragPos = e.position;
@@ -75,9 +78,41 @@ public:
         setValue (proportionOfLengthToValue (dragProportion), juce::sendNotificationSync);
     }
 
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (! rightClick) // what the press was: the other button may be down by now
+            juce::Slider::mouseUp (e);
+    }
+
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (! e.mods.isPopupMenu())
+            juce::Slider::mouseDoubleClick (e);
+    }
+
 private:
     juce::Point<float> lastDragPos;
     double dragProportion = 0.0;
+    bool rightClick = false;
+};
+
+//==============================================================================
+// A button that ignores right clicks (they open the automation menu instead).
+template <typename ButtonType>
+class LeftClickOnly : public ButtonType
+{
+public:
+    using ButtonType::ButtonType;
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        rightClick = e.mods.isPopupMenu();
+        if (! rightClick) ButtonType::mouseDown (e);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { if (! rightClick) ButtonType::mouseDrag (e); }
+    void mouseUp (const juce::MouseEvent& e) override   { if (! rightClick) ButtonType::mouseUp (e); }
+
+private:
+    bool rightClick = false;
 };
 
 //==============================================================================
@@ -125,6 +160,13 @@ private:
     Knob& addKnob (const juce::String& paramId, const juce::String& name, const juce::String& tooltip, int section);
     void addToggle (juce::ToggleButton& button, const juce::String& paramId, const juce::String& text, const juce::String& tooltip);
     void chooseModelFolder();
+
+    // Right-click: the host's menu for a parameter (FL: "Create automation clip"...).
+    void addParameterMenu (juce::Component& component, const juce::StringArray& paramIds);
+    void showParameterMenu (const juce::StringArray& paramIds, juce::Point<int> editorPos);
+    void showHostMenu (const juce::String& paramId, juce::Point<int> editorPos);
+    void showMapMenu();
+    void mouseDown (const juce::MouseEvent&) override; // right clicks on registered components
     void setDragHover (bool hover) { if (dragHover != hover) { dragHover = hover; repaint(); } }
     void timerCallback() override;
 
@@ -140,12 +182,13 @@ private:
     juce::Label titleLabel, modelLabel, statusLabel, providerLabel, coordLabel;
     juce::TextButton loadButton { "Load Model..." }, unloadButton { "Unload" };
     juce::TextButton randomButton { "Random" }, centerButton { "Center" }, resetButton { "Reset" };
-    juce::ToggleButton playOnNoteToggle, holdToggle, snapToggle, keyTrackToggle;
-    juce::TextButton areaModeButton { "Area" }, morphModeButton { "A / B" };
+    LeftClickOnly<juce::ToggleButton> playOnNoteToggle, holdToggle, snapToggle, keyTrackToggle;
+    LeftClickOnly<juce::TextButton> areaModeButton { "Area" }, morphModeButton { "A / B" };
     Knob* blendKnob = nullptr;
     Knob* morphKnob = nullptr;
     void setBlendMode (bool morph);
 
+    std::vector<std::pair<juce::Component*, juce::StringArray>> parameterMenus;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
     std::vector<std::unique_ptr<Knob>> knobs;
     Knob* rootKnob = nullptr;

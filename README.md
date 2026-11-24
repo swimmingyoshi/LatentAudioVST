@@ -139,7 +139,7 @@ The older v1 model is on [Hugging Face](https://huggingface.co/Meowmeow42/Latent
 - **Toolbar**: *Play on Note*, *Hold*, *Snap*, *Key Track*, *Random*, *Center*, MIDI activity light, cursor coordinates, *Reset*.
 - **Sky map**: every star is a sound - colour = brightness (ember red = dark, blue-white = bright), size = how long it rings. The nebula behind the stars is the model's sound *between* them (decoded at export), so you can see where bright, dark or loud regions are before clicking. Moving between stars follows a smooth field: no jumps where the nearest sounds change. Click/drag to play, right/middle-drag to pan, mouse wheel zooms toward the pointer, double-click resets the view. Hover a star to see its name; the nearest sound is named top-left. (Older model folders without a sky map show plain dots and orange blend lines; upgrade them with `scripts/upgrade_map.py` in the LatentAudio repo.)
 - **Waveform**: the generated sound, the Start-End region that plays, and the playhead. **Drag it onto a DAW track** to use the sound as audio (written as a WAV to `Documents/LatentAudio/Exports`); right-click to *Save as WAV...*.
-- **Knobs**: double-click any knob to reset it; hover for a description.
+- **Knobs**: double-click any knob to reset it; right-click a knob or toggle for the host's automation menu (VST3 hosts that provide one); hover for a description.
 
 ### Parameter Controls
 
@@ -171,7 +171,7 @@ The older v1 model is on [Hugging Face](https://huggingface.co/Meowmeow42/Latent
 - **Key Track**: MIDI notes set the pitch. *Pitched* models (status shows "plays any note with Key Track") are asked for the real note: the voice starts instantly on the current sound and crossfades to the model's true note ~50-100 ms later. Other models transpose relative to Root
 
 #### Automation-only parameters
-- **Position X / Position Y**: cursor position (0-1, Y = 1 is the top of the map)
+- **Position X / Position Y** (also in the host's parameter list; right-click the map or its coordinates to automate): cursor position (0-1, Y = 1 is the top of the map)
 - **Inference Rate**: maximum decodes per second while the position is automated (0 = unlimited)
 - **Level**: extra output level (kept for older projects)
 

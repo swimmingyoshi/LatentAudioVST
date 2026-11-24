@@ -44,6 +44,8 @@ public:
     std::function<void()> onMouseReleased;
     std::function<void (float, float)> onMorphTargetChanged; // Shift/Alt-click in morph mode
 
+    std::function<void()> onContextMenu; // right-click without dragging
+
     void paint (juce::Graphics&) override;
     void resized() override { layerDirty = true; }
     void mouseDown (const juce::MouseEvent&) override;
@@ -81,7 +83,7 @@ private:
     int hoverIndex = -1;
 
     bool isSnapping = false;
-    bool isPanning = false;
+    bool isPanning = false, rightPress = false;
     float zoom = 1.0f;
     float panX = 0.0f, panY = 0.0f;       // view centre offset from map centre (map units)
     float panStartX = 0.0f, panStartY = 0.0f;
