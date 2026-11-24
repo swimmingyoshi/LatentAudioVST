@@ -333,6 +333,14 @@ void LatentAudioVSTAudioProcessorEditor::showMapMenu()
         });
 }
 
+juce::String LatentAudioVSTAudioProcessorEditor::positionMenuName (const juce::String& paramId, bool abMode)
+{
+    const auto axis = juce::String (paramId.endsWith ("X") ? "Position X" : "Position Y");
+    if (! abMode)
+        return axis;
+    return (paramId.startsWith ("morph") ? "B: " : "A: ") + axis;
+}
+
 void LatentAudioVSTAudioProcessorEditor::showParameterMenu (const juce::StringArray& paramIds, juce::Point<int> editorPos)
 {
     if (paramIds.size() == 1)
@@ -349,7 +357,7 @@ void LatentAudioVSTAudioProcessorEditor::showParameterMenu (const juce::StringAr
     {
         if (auto* param = processor.getAPVTS().getParameter (id))
         {
-            menu.addItem (param->getName (64),
+            menu.addItem (positionMenuName (id, processor.isMorphMode()),
                 [safeThis = juce::Component::SafePointer<LatentAudioVSTAudioProcessorEditor> (this), id, editorPos]
                 {
                     if (safeThis != nullptr)

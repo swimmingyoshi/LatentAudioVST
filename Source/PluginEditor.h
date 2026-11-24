@@ -166,6 +166,10 @@ private:
     void showParameterMenu (const juce::StringArray& paramIds, juce::Point<int> editorPos);
     void showHostMenu (const juce::String& paramId, juce::Point<int> editorPos);
     void showMapMenu();
+public:
+    // Menu text for a position parameter: A/B mode says which point it moves (exposed for tests).
+    static juce::String positionMenuName (const juce::String& paramId, bool abMode);
+private:
     void mouseDown (const juce::MouseEvent&) override; // right clicks on registered components
     void setDragHover (bool hover) { if (dragHover != hover) { dragHover = hover; repaint(); } }
     void timerCallback() override;

@@ -26,6 +26,12 @@ LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interac
 
 ![LatentAudioVST sky map with the strings model](images/sky-map.png)
 
+## What's New in v2.0.1
+
+- Right-click a knob, toggle, the map or its coordinates for the host's automation menu (VST3 hosts that provide one)
+- In A/B mode the map's menu says which point it moves (A or B). Hosts list point B as *Morph B X / Y*
+- Right-clicking no longer starts an automation gesture on knobs or flips toggles
+
 ## What's New in v2.0
 
 - **Sky map**: sounds are stars coloured by brightness, with a smooth field between them instead of jumps

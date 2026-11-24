@@ -987,6 +987,11 @@ public:
             r.proc.removeListener (&gestures);
             editor->setHostContext (nullptr);
 
+            using Ed = LatentAudioVSTAudioProcessorEditor;
+            expectEquals (Ed::positionMenuName ("positionX", false), juce::String ("Position X"));
+            expectEquals (Ed::positionMenuName ("positionY", true), juce::String ("A: Position Y"));
+            expectEquals (Ed::positionMenuName ("morphX", true), juce::String ("B: Position X"));
+
             // Map: a right click asks for the menu, a right drag (pan) does not.
             int menus = 0;
             auto original = std::exchange (nebula->onContextMenu, [&] { ++menus; });
