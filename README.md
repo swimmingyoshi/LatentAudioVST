@@ -22,8 +22,6 @@ The runtime is delay-loaded by full path from that folder, so the plugin never p
 
 LatentAudioVST is a JUCE-based VST3 audio plugin that provides real-time interactive exploration of latent audio representations. It allows musicians and sound designers to navigate a 2D latent space where each position corresponds to a unique audio sample, enabling continuous and creative audio generation through visual exploration.
 
-[Watch the demo video on YouTube](https://www.youtube.com/watch?v=94xgIDpDgX0)
-
 ![LatentAudioVST sky map with the strings model](images/sky-map.png)
 
 ## What's New in v2.0.1
